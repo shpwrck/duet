@@ -1,0 +1,90 @@
+# duet
+
+An etcd-compatible datastore for Kubernetes control planes that share one
+disk instead of running a consensus protocol between themselves.
+
+The target platform is VMware Cloud Foundation: control plane VMs on a vSAN
+cluster, sharing one vSAN-backed virtual disk. vSAN, with the witness it
+already has, replicates the disk and breaks ties when hosts are partitioned.
+duet adds no arbiter of its own. Two nodes is the minimum; the same protocol
+runs with more.
+
+The idea is the one Amazon EKS uses at 100,000 nodes: take Raft out, keep a
+single writer, and push durability and ordering into a replicated log. Here
+the log is a shared disk.
+
+**Status: early.** The ownership protocol and the log exist and are tested
+in simulation. There is no etcd API yet, and nothing has run on vSAN. See
+[what exists](#what-exists-today) before drawing conclusions.
+
+## How it works
+
+- **One writer per epoch.** The owner appends checksummed records to the
+  log on the shared disk, many records per flush.
+- **Ownership is decided on the disk.** A Disk Paxos ballot over per-node
+  blocks picks the owner of each epoch. A timed lease tells the others when
+  they may start a ballot. Nothing is decided over the network, so a network
+  partition between nodes cannot create two owners.
+- **Everyone else tails.** Other nodes read the log as it grows and stay
+  warm, so takeover replays only the unread tail.
+- **A deposed writer is harmless.** It acknowledges a write only if its
+  lease was still valid after the data reached the disk. A late write lands
+  in a gap that no reader ever looks at.
+
+[docs/DESIGN.md](docs/DESIGN.md) has the protocol, its assumptions and the
+safety argument.
+
+## What exists today
+
+| Piece | State |
+| --- | --- |
+| Disk layout, metadata blocks (`pkg/disk`) | Implemented |
+| Record log with group commit (`pkg/wal`) | Implemented, no trimming yet |
+| Disk Paxos ownership and leases (`pkg/lease`) | Implemented |
+| Writer, tailer, takeover (`pkg/node`) | Implemented |
+| Fault simulation and tests | Implemented, see below |
+| etcd gRPC API, state machine | Not started |
+| Checkpoints and log trimming | Not started |
+| Daemon, direct I/O, real clocks | Not started |
+| SCSI-3 reservation backend | Not started |
+| TLA+ model | Not started |
+| Lab environments | Described in [docs/LAB.md](docs/LAB.md), not built |
+| Anything on vSAN | Not started; needs a lab |
+
+## Tests
+
+```
+go test ./...                    # about two seconds
+DUET_SEEDS=6000 go test ./pkg/node -run TestRandomSchedules -v   # soak
+```
+
+The tests run several nodes against one in-memory disk and interleave them
+at the level of single block reads and writes. They cover a writer paused
+mid-write past its lease, renewals racing ballots at every interleaving,
+ballots racing each other, crashes at every step of a ballot, handover,
+restart, a torn tail, and randomised schedules with pauses, slow I/O, clock
+skew and crashes.
+
+What that does and does not show:
+
+- Each of ten deliberate bugs in the safety rules (for example, dropping the
+  check after write) makes at least one test fail. The full suite catches all
+  ten; the randomised test alone catches eight of ten at 4,000 seeds.
+- A 6,000-schedule run passed with about 69,000 acknowledged writes and
+  55,000 ownership changes.
+- The simulated disk is ideal: linearizable, atomic block writes, durable on
+  return. Whether a vSAN multi-writer disk behaves that way is unverified
+  and is the first thing to test on real hardware.
+- Passing tests are evidence, not proof. A TLA+ model and independent
+  testing are planned before any production claim.
+
+## Documents
+
+- [docs/DESIGN.md](docs/DESIGN.md): protocol, assumptions, scaling path, milestones
+- [docs/PRIOR-ART.md](docs/PRIOR-ART.md): Kine, GKE on Spanner, EKS on Journal and others, and what each lacks here
+- [docs/VCF-GAPS.md](docs/VCF-GAPS.md): what is unverified or missing in VCF for this to ship
+- [docs/LAB.md](docs/LAB.md): open-source stand-ins for vSAN until a real lab is available
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
