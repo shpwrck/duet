@@ -48,7 +48,7 @@ fi
 openssl genrsa -out "$W/sa.key" 2048 2>/dev/null
 openssl rsa -in "$W/sa.key" -pubout -out "$W/sa.pub" 2>/dev/null
 echo "testtoken,admin,admin,system:masters" >"$W/tokens.csv"
-"$KUBE_BIN/kube-apiserver" --etcd-servers="$SERVERS" \
+"$KUBE_BIN/kube-apiserver" --etcd-servers="${FIRST_ETCD:-$SERVERS}" \
   --service-account-issuer=https://kubernetes.default.svc --service-account-key-file="$W/sa.pub" \
   --service-account-signing-key-file="$W/sa.key" --cert-dir="$W/certs" --secure-port=6443 \
   --bind-address=127.0.0.1 --authorization-mode=AlwaysAllow --token-auth-file="$W/tokens.csv" \

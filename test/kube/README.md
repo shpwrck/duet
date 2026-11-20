@@ -78,6 +78,28 @@ about 45 of 400 creates failed where etcd failed one. Now every node
 listens, and a node that does not own the log holds a call until the
 owner is reachable and then forwards it.
 
+## Two sites, a kube-apiserver in each
+
+`twosites.sh` runs two kube-apiservers, each talking only to the datastore
+member beside it, and sends writes through both. Then site A is lost
+outright: its datastore member and its API server (for etcd, the site
+holding two of the three members). Later it returns.
+
+One run each on 20 Nov 2026, same machine and versions as above:
+
+| | duet, 2 nodes | etcd, 3 members |
+| --- | --- | --- |
+| Both sites up: creates acknowledged, of 60 | 60, half through each API server | 60, half through each |
+| Site A lost: creates through site B, of 150 | 149; first one 2.6 s after the loss | 36, all from before the loss; none after |
+| Site B's API server during the outage | serving | cannot read: no majority |
+| Site A back: earlier acknowledged creates missing | 0 of 244 | 0 of 131 |
+| Site A back: new creates, of 60 | 60, half through each | 60, half through each |
+
+This is the two-zone result from the cloud lab, reproduced with real API
+servers: with etcd's majority in the lost site, the surviving site's API
+server is up but useless until the site returns. Neither system lost an
+acknowledged write.
+
 ## A whole control plane, with simulated nodes
 
 `controlplane.sh` adds kube-controller-manager and kube-scheduler, with
