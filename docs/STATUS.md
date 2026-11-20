@@ -64,8 +64,10 @@ What that does and does not show:
   one epoch two owners (see "Why the slot is read last" and "A ballot
   goes by the table" in DESIGN.md). Each needs three nodes stalled
   mid-operation in a particular order. `TestRandomInterleavings` was
-  added to explore that kind of schedule, and 20,000 runs of it still
-  did not find the second fault when it was put back. Random testing is
+  added to explore that kind of schedule. With each fault put back in
+  turn it found neither: 20,000 schedules at its defaults, then 6,000
+  and 15,000 at two settings biased toward restarts, renewals and long
+  stalls (the `ILV_*` variables). Random testing is
   not finding this class of fault here. The model in `docs/tla` is the
   tool for it and has not been run.
 - Passing tests are evidence, not proof. A TLA+ model and independent

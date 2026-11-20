@@ -30,7 +30,7 @@ func TestRandomInterleavings(t *testing.T) {
 	}
 	var ops, acked, epochs int
 	for seed := 1; seed <= seeds; seed++ {
-		o, a, e := runInterleaved(t, int64(seed), 3, 1500)
+		o, a, e := runInterleaved(t, int64(seed), 3, ilv.steps)
 		ops, acked, epochs = ops+o, acked+a, epochs+e
 		if t.Failed() {
 			t.Fatalf("seed %d", seed)
@@ -40,6 +40,19 @@ func TestRandomInterleavings(t *testing.T) {
 }
 
 type stopped struct{}
+
+// Knobs, settable from the environment for experiments.
+var ilv = struct{ steps, timeEvery, freezeEvery, freezeMax, wAppend, wCampaign, wTail, wRenew, wRestart int }{
+	steps: env("ILV_STEPS", 1500), timeEvery: env("ILV_TIME", 12), freezeEvery: env("ILV_FREEZE", 20), freezeMax: env("ILV_FREEZEMAX", 300),
+	wAppend: env("ILV_APPEND", 4), wCampaign: env("ILV_CAMPAIGN", 3), wTail: env("ILV_TAIL", 2), wRenew: env("ILV_RENEW", 2), wRestart: env("ILV_RESTART", 1),
+}
+
+func env(name string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+		return v
+	}
+	return def
+}
 
 func runInterleaved(t *testing.T, seed int64, nodes, steps int) (ops, acked, epochs int) {
 	w := newWorld(t, nodes)
@@ -90,14 +103,15 @@ func runInterleaved(t *testing.T, seed int64, nodes, steps int) (ops, acked, epo
 				}
 				s := sims[id]
 				var err error
-				switch r := rng.Intn(12); {
-				case r < 4:
+				a, c, tl, rn := ilv.wAppend, ilv.wAppend+ilv.wCampaign, ilv.wAppend+ilv.wCampaign+ilv.wTail, ilv.wAppend+ilv.wCampaign+ilv.wTail+ilv.wRenew
+				switch r := rng.Intn(rn + ilv.wRestart); {
+				case r < a:
 					err = w.append(s, payload(id, &seq))
-				case r < 7:
+				case r < c:
 					err = s.n.Campaign()
-				case r < 9:
+				case r < tl:
 					err = s.n.Tail()
-				case r < 11:
+				case r < rn:
 					err = s.n.Renew()
 				default: // the process dies and a new one starts
 					s.dev.dead = true
@@ -120,7 +134,7 @@ func runInterleaved(t *testing.T, seed int64, nodes, steps int) (ops, acked, epo
 	clockStopped := make([]bool, nodes)
 	failed := false
 	for step := 0; step < steps && !failed; step++ {
-		if rng.Intn(12) == 0 {
+		if rng.Intn(ilv.timeEvery) == 0 {
 			dt := time.Duration(rng.Int63n(int64(3 * simTTL / 2)))
 			w.now += dt
 			for i := range sims {
@@ -129,9 +143,9 @@ func runInterleaved(t *testing.T, seed int64, nodes, steps int) (ops, acked, epo
 				}
 			}
 		}
-		if rng.Intn(20) == 0 {
+		if rng.Intn(ilv.freezeEvery) == 0 {
 			i := rng.Intn(nodes)
-			frozenUntil[i] = step + 10 + rng.Intn(300)
+			frozenUntil[i] = step + 10 + rng.Intn(ilv.freezeMax)
 			clockStopped[i] = rng.Intn(2) == 0
 		}
 		var free []int
