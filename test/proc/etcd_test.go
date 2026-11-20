@@ -602,3 +602,165 @@ func TestRepeatedPlannedStops(t *testing.T) {
 		t.Fatalf("a planned stop held a write for %s; the handover itself takes a fraction of a second", slowest)
 	}
 }
+
+func stateHash(t *testing.T, p *proc) (applied, rev, hash, resumed uint64, ok bool) {
+	t.Helper()
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(p.url + "/statehash")
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return
+	}
+	_, err = fmt.Fscan(resp.Body, &applied, &rev, &hash, &resumed)
+	return applied, rev, hash, resumed, err == nil
+}
+
+// Both nodes are killed at once under load, several times over, and each
+// time they start again from the state files on their own disks instead of
+// reading a checkpoint back. Afterwards every acknowledged write is there,
+// and the state the two have carried through the crashes is identical to
+// the state of a third node that builds its own from the shared disk alone.
+func TestBothNodesKilledContinueFromLocalState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts real processes; skipped with -short")
+	}
+	c, _ := setup(t, "-checkpoint-size", "8388608")
+	eps := []string{freeAddr(t), freeAddr(t), freeAddr(t)}
+	addrs := []string{freeAddr(t), freeAddr(t), freeAddr(t)}
+	dirs := []string{t.TempDir(), t.TempDir(), t.TempDir()}
+	start := func(i int, extra ...string) *proc {
+		args := append([]string{"-etcd", eps[i], "-etcd-peers", strings.Join(eps[:2], ","), "-state-dir", dirs[i], "-checkpoint-every", "3000"}, extra...)
+		return c.start(i, addrs[i], args...)
+	}
+	c.nodes = []*proc{start(0), start(1)}
+	defer func() {
+		for _, p := range c.nodes {
+			p.cmd.Process.Kill()
+			p.cmd.Wait()
+		}
+	}()
+	c.owner()
+
+	var mu sync.Mutex
+	acked := map[string]string{}
+	var n atomic.Int64
+	for round := 0; round < 4; round++ {
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		for w := 0; w < 4; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				cli, err := clientv3.New(clientv3.Config{Endpoints: eps[:2], DialTimeout: 2 * time.Second})
+				if err != nil {
+					return
+				}
+				defer cli.Close()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					i := n.Add(1)
+					k, v := fmt.Sprintf("/cold/%04d", i%500), fmt.Sprint(i)
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+					// Create or overwrite, and now and then delete, so that
+					// applying a record twice would show.
+					var err error
+					if i%7 == 0 {
+						_, err = cli.Delete(ctx, k)
+						v = ""
+					} else {
+						_, err = cli.Put(ctx, k, v)
+					}
+					cancel()
+					mu.Lock()
+					if err == nil {
+						acked[k] = v
+					} else {
+						delete(acked, k) // outcome unknown
+					}
+					mu.Unlock()
+				}
+			}()
+		}
+		time.Sleep(1500 * time.Millisecond)
+		for _, p := range c.nodes[:2] { // both at once, mid-write
+			p.cmd.Process.Kill()
+		}
+		for _, p := range c.nodes[:2] {
+			p.cmd.Wait()
+		}
+		close(stop)
+		wg.Wait()
+		c.nodes = []*proc{start(0), start(1)}
+		c.owner()
+		for _, p := range c.nodes {
+			var resumed uint64
+			for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+				if _, _, _, r, ok := stateHash(t, p); ok {
+					resumed = r
+					break
+				}
+			}
+			if resumed == 0 {
+				t.Fatalf("round %d: node %d did not continue from its local state", round, p.id)
+			}
+		}
+	}
+
+	cli, err := clientv3.New(clientv3.Config{Endpoints: eps[:2], DialTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	// Writes whose outcome was unknown when the nodes died were dropped
+	// from the expectation only if no later write to the key was
+	// acknowledged, so every key left in acked has a definite value.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	g, err := cli.Get(ctx, "/cold/", clientv3.WithPrefix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, kv := range g.Kvs {
+		got[string(kv.Key)] = string(kv.Value)
+	}
+	checked := 0
+	for k, v := range acked {
+		if got[k] != v {
+			t.Fatalf("%s: have %q, acknowledged %q", k, got[k], v)
+		}
+		checked++
+	}
+
+	// A third node with nothing on its own disk builds the state from the
+	// shared disk. All three must agree.
+	third := start(2, "-campaign=false")
+	c.nodes = append(c.nodes, third)
+	var want [3]uint64
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the nodes did not reach the same index")
+		}
+		a0, r0, h0, _, ok0 := stateHash(t, c.nodes[0])
+		a1, r1, h1, _, ok1 := stateHash(t, c.nodes[1])
+		a2, r2, h2, res2, ok2 := stateHash(t, third)
+		if !ok0 || !ok1 || !ok2 || a0 != a1 || a1 != a2 {
+			continue
+		}
+		if res2 != 0 {
+			t.Fatal("the third node had no local state to continue from")
+		}
+		if r0 != r1 || r1 != r2 || h0 != h1 || h1 != h2 {
+			t.Fatalf("at index %d: revisions %d %d %d, hashes %d %d %d", a0, r0, r1, r2, h0, h1, h2)
+		}
+		want = [3]uint64{a0, r0, h0}
+		break
+	}
+	t.Logf("4 double kills, %d keys with a definite acknowledged value checked; all three nodes at index %d, revision %d, hash %d", checked, want[0], want[1], want[2])
+}

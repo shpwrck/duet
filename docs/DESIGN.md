@@ -157,6 +157,21 @@ loads the newest intact checkpoint and replays only the log after it.
   the state and the log position describe the same moment. The copy to
   disk runs in the background from a database snapshot.
 
+A node that restarts with its own disk intact does not read a checkpoint
+back. It keeps the etcd state file in its state directory and records, in
+every database commit, the index of the last record whose writes that
+commit contains. This is how etcd itself ties its applied index to its
+data. On start the node opens that file, reads the log again from the
+newest checkpoint the file already covers, and skips the records it
+holds. The file is tied to the shared disk by an identity chosen at
+format time, so state built from one log is never continued from
+another. A node whose state is missing, belongs to another disk, or is
+behind the newest checkpoint restores from the shared disk as before.
+Two tests cover it: one reopens the file as it would be after a crash at
+each of 324 points and checks the result matches never having crashed;
+the other kills both nodes at once four times under load and compares
+their state with a third node built from the shared disk alone.
+
 A state larger than a checkpoint slot cannot be checkpointed, and a state
 that cannot be checkpointed means the log is never reused: it fills, and
 then nothing can be written and no node can even be elected. A soak run

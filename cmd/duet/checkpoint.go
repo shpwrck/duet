@@ -17,6 +17,66 @@ import (
 // disk, written by any node, and returns where the log continues. With no
 // usable checkpoint the store starts empty and the whole log is replayed.
 func (s *server) restore(stateDir string) (node.Cursor, error) {
+	if c, ok := s.resumeLocal(stateDir); ok {
+		return c, nil
+	}
+	c, err := s.restoreShared(stateDir)
+	if err == nil {
+		s.st.Bind(s.l.ID[:])
+	}
+	return c, err
+}
+
+// resumeLocal continues from the state this node left on its own disk, if
+// it is intact, was built from this shared disk, and is not behind what a
+// checkpoint offers. It is the common case after a restart and avoids
+// reading a whole checkpoint back. The log is read again from the newest
+// checkpoint the state already contains (or from the start, if nothing has
+// been trimmed) and records the state already holds are skipped.
+func (s *server) resumeLocal(stateDir string) (node.Cursor, bool) {
+	if s.l.ID == ([16]byte{}) {
+		return node.Cursor{}, false // a disk formatted before IDs existed
+	}
+	st, err := sm.OpenLocal(stateDir, s.l.ID[:])
+	if err != nil {
+		return node.Cursor{}, false
+	}
+	have := st.Applied()
+	head, err1 := trim.Head(s.dev, s.l)
+	metas, err2 := ckpt.All(s.dev, s.l)
+	if err1 != nil || err2 != nil {
+		st.Close()
+		return node.Cursor{}, false
+	}
+	var from *ckpt.Meta
+	for i, m := range metas {
+		if m.Cursor.Next != m.Applied+1 || (head > s.l.LogStart() && m.Cursor.Offset < head) {
+			continue
+		}
+		if m.Applied > have {
+			st.Close() // a checkpoint is ahead of the local state: use it
+			return node.Cursor{}, false
+		}
+		if from == nil || m.Applied > from.Applied {
+			from = &metas[i]
+		}
+	}
+	switch {
+	case from != nil:
+		s.base, s.ckptLast, s.ckptLastOff = from.Applied, from.Applied, from.Cursor.Offset
+		s.st, s.skipTo = st, have
+		log.Printf("node %d: continuing from local state at index %d, reading the log from index %d", s.id, have, from.Applied+1)
+		return from.Cursor, true
+	case head <= s.l.LogStart():
+		s.st, s.skipTo = st, have
+		log.Printf("node %d: continuing from local state at index %d, reading the log from its start", s.id, have)
+		return node.Cursor{}, true
+	}
+	st.Close()
+	return node.Cursor{}, false
+}
+
+func (s *server) restoreShared(stateDir string) (node.Cursor, error) {
 	// A checkpoint behind the published head is useless: the log between
 	// the two may have been reused. If the only good one is being replaced
 	// right now, a newer one is seconds away, so wait for it.

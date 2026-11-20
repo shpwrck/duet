@@ -23,7 +23,8 @@ func TestDirectFileDevice(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := Open(dev)
-	if err != nil || got != l {
+	l.ID = got.ID // chosen by Format
+	if err != nil || got.ID == ([16]byte{}) || got != l {
 		t.Fatalf("Open = %+v, %v; want %+v", got, err, l)
 	}
 	// An unaligned read spanning two blocks.

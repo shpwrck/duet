@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -36,6 +37,10 @@ type Layout struct {
 	// CkptSize is the space for one checkpoint, in bytes. Every node has
 	// two such slots. Zero means the disk holds no checkpoints.
 	CkptSize int64
+	// ID is chosen at random when the disk is formatted. State a node
+	// keeps on its own disk is tied to it, so that state built from one
+	// log is never continued from another.
+	ID [16]byte
 }
 
 func (l Layout) Validate() error {
@@ -173,7 +178,13 @@ func Format(dev Device, l Layout) error {
 			}
 		}
 	}
-	p := make([]byte, 44)
+	if l.ID == ([16]byte{}) {
+		if _, err := rand.Read(l.ID[:]); err != nil {
+			return err
+		}
+	}
+	p := make([]byte, 60)
+	copy(p[44:], l.ID[:])
 	binary.LittleEndian.PutUint32(p[0:], superMagic)
 	binary.LittleEndian.PutUint32(p[4:], formatVer)
 	binary.LittleEndian.PutUint32(p[8:], uint32(l.Nodes))
@@ -206,6 +217,9 @@ func Open(dev Device) (Layout, error) {
 	}
 	if len(p) >= 44 {
 		l.CkptSize = int64(binary.LittleEndian.Uint64(p[36:]))
+	}
+	if len(p) >= 60 {
+		copy(l.ID[:], p[44:60])
 	}
 	if err := l.Validate(); err != nil {
 		return Layout{}, err

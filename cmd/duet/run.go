@@ -111,6 +111,7 @@ type server struct {
 	dev           disk.Device
 	ckptEvery     uint64
 	quota         int64
+	skipTo        uint64       // records up to here are already in the local state
 	ckptLast      uint64       // index at which the last checkpoint was started
 	ckptLastOff   int64        // and the log offset there
 	ckptPrevOff   atomic.Int64 // log offset of the last checkpoint known to be on disk
@@ -134,7 +135,7 @@ type server struct {
 // driven by its own goroutine, so that the loop can start the next disk
 // write while the previous batch is still being applied.
 func (s *server) apply(index uint64, payload []byte) {
-	if s.st != nil {
+	if s.st != nil && index > s.skipTo {
 		t := applyTask{index: index, payload: payload}
 		if s.pending != nil {
 			t.req, s.pending = s.pending[0], s.pending[1:]
@@ -374,6 +375,22 @@ func (s *server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	json.NewEncoder(w).Encode(st)
 }
 
+// handleStateHash reports a hash of the etcd state. Two nodes that report
+// the same applied index must report the same hash and revision.
+func (s *server) handleStateHash(w http.ResponseWriter, r *http.Request) {
+	if s.st == nil {
+		http.Error(w, "no etcd state", http.StatusNotFound)
+		return
+	}
+	before := s.st.Applied()
+	h, rev, err := s.st.Hash()
+	if err != nil || s.st.Applied() != before {
+		http.Error(w, "state is changing", http.StatusConflict)
+		return
+	}
+	fmt.Fprintf(w, "%d %d %d %d\n", before, rev, h, s.skipTo)
+}
+
 // handleHashes returns one payload hash per line for indexes from..to.
 func (s *server) handleHashes(w http.ResponseWriter, r *http.Request) {
 	from, _ := strconv.ParseUint(r.URL.Query().Get("from"), 10, 64)
@@ -449,6 +466,7 @@ func cmdRun(args []string) error {
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/hashes", s.handleHashes)
+	mux.HandleFunc("/statehash", s.handleStateHash)
 	srv := &http.Server{Addr: *listen, Handler: mux}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

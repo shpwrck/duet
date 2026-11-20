@@ -3,7 +3,11 @@ package sm_test
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"go.etcd.io/etcd/server/v3/storage/mvcc"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -206,4 +210,90 @@ func TestSnapshotRestore(t *testing.T) {
 	if rr, err := b.KV().Range(context.Background(), []byte("/leased"), nil, mvcc.RangeOptions{}); err != nil || len(rr.KVs) != 0 {
 		t.Fatalf("leased key survived revoke on the restored store: %v %+v", err, rr)
 	}
+}
+
+// A node that dies leaves its state file as of some database commit. For
+// every point at which that could be, reopening the file and applying the
+// log from the index the file records must end in the same state as never
+// having died. The stream includes records that change no keys (a failed
+// compare, a lease grant), which are the ones whose index could lag.
+func TestReopenedStateCatchesUpToTheSameState(t *testing.T) {
+	tag := []byte("disk-1")
+	var cmds [][]byte
+	for i := 0; i < 40; i++ {
+		k := fmt.Sprintf("/registry/pods/p%d", i%7)
+		id := int64(100 + i)
+		for _, c := range []*sm.Command{
+			{Put: &pb.PutRequest{Key: []byte(k), Value: []byte(fmt.Sprint(i))}},
+			casPut(k, "never", 1<<40), // compare fails, nothing written
+			{LeaseGrant: &pb.LeaseGrantRequest{ID: id, TTL: 60}},
+			{Put: &pb.PutRequest{Key: []byte(k + "/ev"), Value: []byte("e"), Lease: id}},
+			casPut(k, "never", 1<<40),
+			{LeaseRevoke: &pb.LeaseRevokeRequest{ID: id}},
+			{LeaseGrant: &pb.LeaseGrantRequest{ID: id + 1000, TTL: 60}},
+			{DeleteRange: &pb.DeleteRangeRequest{Key: []byte(fmt.Sprintf("/registry/pods/p%d", (i+3)%7))}},
+		} {
+			cmds = append(cmds, mustEncode(t, c))
+		}
+		if i%10 == 9 {
+			cmds = append(cmds, mustEncode(t, &sm.Command{Compaction: &pb.CompactionRequest{Revision: int64(i)}}))
+		}
+	}
+	live := open(t)
+	live.Bind(tag)
+	type image struct {
+		at   int
+		data []byte
+	}
+	var images []image
+	for i, c := range cmds {
+		live.Apply(uint64(i+1), c)
+		snap := live.Snapshot() // the file exactly as a crash here would leave it
+		var buf bytes.Buffer
+		if _, err := snap.WriteTo(&buf); err != nil {
+			t.Fatal(err)
+		}
+		snap.Close()
+		images = append(images, image{i + 1, buf.Bytes()})
+	}
+	want, _, err := live.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	behind := 0
+	for _, im := range images {
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, "state"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "state", "db"), im.data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sm.OpenLocal(dir, []byte("another-disk")); !errors.Is(err, sm.ErrNoLocal) {
+			t.Fatalf("state bound to one disk opened for another: %v", err)
+		}
+		s, err := sm.OpenLocal(dir, tag)
+		if err != nil {
+			t.Fatalf("image at %d: %v", im.at, err)
+		}
+		from := int(s.Applied())
+		if from > im.at {
+			t.Fatalf("image at %d claims %d", im.at, from)
+		}
+		if from < im.at {
+			behind++
+		}
+		for i := from; i < len(cmds); i++ {
+			s.Apply(uint64(i+1), cmds[i])
+		}
+		got, _, err := s.Hash()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want || s.Revision() != live.Revision() {
+			t.Fatalf("image at %d, resumed from %d: hash %x rev %d, want %x rev %d", im.at, from, got, s.Revision(), want, live.Revision())
+		}
+		s.Close()
+	}
+	t.Logf("%d crash points, %d of them with the recorded index behind the contents", len(images), behind)
 }

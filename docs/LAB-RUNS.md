@@ -82,7 +82,9 @@ What it shows:
   directory on its own disk is intact. An etcd member starts from its own
   disk. On one machine the replay alone costs about 2 s per 95,000
   records; the checkpoint here was over 1 GiB, read over the network.
-  Starting from the local state when it is intact is not implemented.
+  Starting from the local state when it is intact was added after this
+  run (see "Checkpoints" in DESIGN.md) and has not been measured in the
+  lab yet.
   The node logs were not kept for this run, so this split is an
   estimate.
 - **The disk is slower from one zone, and that explains the swing in

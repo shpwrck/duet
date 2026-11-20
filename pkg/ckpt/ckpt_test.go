@@ -18,7 +18,9 @@ func setup(t *testing.T) (*disk.MemDevice, disk.Layout) {
 	if err := disk.Format(dev, l); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := disk.Open(dev); err != nil || got != l {
+	got, err := disk.Open(dev)
+	l.ID = got.ID // chosen by Format
+	if err != nil || got != l {
 		t.Fatalf("layout did not survive format: %+v %v", got, err)
 	}
 	return dev, l
