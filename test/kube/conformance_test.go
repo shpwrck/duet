@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/etcd3"
 	storagetesting "k8s.io/apiserver/pkg/storage/testing"
+	"k8s.io/apiserver/pkg/storage/value"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/utils/clock"
@@ -99,32 +101,83 @@ func TestMain(m *testing.M) {
 	}())
 }
 
-// setup builds the store kube-apiserver would build for one resource, under
-// a prefix unique to the test so tests do not see each other's objects.
-func setup(t *testing.T) (context.Context, storage.Interface, *kubernetes.Client) {
+// swappable lets a test replace the value transformer of a store that is
+// already built, which Kubernetes' own tests do by reaching into the store.
+type swappable struct {
+	mu  sync.RWMutex
+	cur value.Transformer
+}
+
+func (s *swappable) get() value.Transformer {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cur
+}
+
+func (s *swappable) TransformFromStorage(ctx context.Context, data []byte, dataCtx value.Context) ([]byte, bool, error) {
+	return s.get().TransformFromStorage(ctx, data, dataCtx)
+}
+
+func (s *swappable) TransformToStorage(ctx context.Context, data []byte, dataCtx value.Context) ([]byte, error) {
+	return s.get().TransformToStorage(ctx, data, dataCtx)
+}
+
+type env struct {
+	storage.Interface
+	client      *kubernetes.Client
+	codec       runtime.Codec
+	transformer *swappable
+	original    *storagetesting.PrefixTransformer
+}
+
+func (e *env) UpdatePrefixTransformer(modifier storagetesting.PrefixTransformerModifier) func() {
+	copied := *e.original
+	e.transformer.mu.Lock()
+	e.transformer.cur = modifier(&copied)
+	e.transformer.mu.Unlock()
+	return func() {
+		e.transformer.mu.Lock()
+		e.transformer.cur = e.original
+		e.transformer.mu.Unlock()
+	}
+}
+
+// setupEnv builds the store kube-apiserver would build for one resource,
+// under a prefix unique to the test so tests do not see each other's
+// objects. The client records calls the way Kubernetes' test server does.
+func setupEnv(t *testing.T) (context.Context, *env) {
 	t.Helper()
 	client, err := kubernetes.New(clientv3.Config{Endpoints: endpoints, DialTimeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { client.Close() })
+	recorder := storagetesting.NewKubernetesRecorder(client.Kubernetes)
+	client.KV = storagetesting.NewKVRecorder(client.KV, recorder)
+	client.Kubernetes = recorder
 	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
 	versioner := storage.APIObjectVersioner{}
 	compactor := etcd3.NewCompactor(client.Client, 0, clock.RealClock{}, nil)
 	t.Cleanup(compactor.Stop)
-	prefix := "/" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
+	prefix := "/" + strings.NewReplacer("/", "_", " ", "_", "=", "_").Replace(t.Name())
+	original := storagetesting.NewPrefixTransformer([]byte("test!"), false)
+	tr := &swappable{cur: original}
 	store, err := etcd3.New(client, compactor, codec,
 		func() runtime.Object { return &example.Pod{} },
 		func() runtime.Object { return &example.PodList{} },
 		prefix, "/pods/", schema.GroupResource{Resource: "pods"},
-		storagetesting.NewPrefixTransformer([]byte("test!"), false),
-		etcd3.NewDefaultLeaseManagerConfig(),
+		tr, etcd3.NewDefaultLeaseManagerConfig(),
 		etcd3.NewDefaultDecoder(codec, versioner), versioner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(store.Close)
-	return context.Background(), store, client
+	return context.Background(), &env{Interface: store, client: client, codec: codec, transformer: tr, original: original}
+}
+
+func setup(t *testing.T) (context.Context, storage.Interface, *kubernetes.Client) {
+	ctx, e := setupEnv(t)
+	return ctx, e.Interface, e.client
 }
 
 func increaseRV(c *kubernetes.Client) storagetesting.IncreaseRVFunc {
@@ -210,6 +263,37 @@ func TestStorage(t *testing.T) {
 		ctx, s, c := setup(t)
 		storagetesting.RunTestGetListNonRecursive(ctx, t, increaseRV(c), s)
 	})
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("List/rangeStream=%v", stream), func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EtcdRangeStream, stream)
+			ctx, e := setupEnv(t)
+			storagetesting.RunTestList(ctx, t, e.Interface, compact(e.client), false, e.client.Kubernetes.(*storagetesting.KubernetesRecorder))
+			streamed := e.client.KV.(*storagetesting.KVRecorder).GetStreamReadsAndReset()
+			if stream != (streamed > 0) {
+				t.Errorf("rangeStream=%v but %d lists used RangeStream", stream, streamed)
+			}
+		})
+	}
+	t.Run("GuaranteedUpdate", func(t *testing.T) {
+		ctx, e := setupEnv(t)
+		storagetesting.RunTestGuaranteedUpdate(ctx, t, e, func(context.Context, *testing.T, string) {})
+	})
+	t.Run("GuaranteedUpdateChecksStoredData", func(t *testing.T) {
+		ctx, e := setupEnv(t)
+		storagetesting.RunTestGuaranteedUpdateChecksStoredData(ctx, t, e)
+	})
+	t.Run("TransformationFailure", func(t *testing.T) {
+		ctx, e := setupEnv(t)
+		storagetesting.RunTestTransformationFailure(ctx, t, e)
+	})
+	t.Run("ListResourceVersionMatch", func(t *testing.T) {
+		ctx, e := setupEnv(t)
+		storagetesting.RunTestListResourceVersionMatch(ctx, t, e)
+	})
+	t.Run("Stats", func(t *testing.T) {
+		ctx, e := setupEnv(t)
+		storagetesting.RunTestStats(ctx, t, e.Interface, e.codec, e.transformer, false)
+	})
 	t.Run("CompactRevision", func(t *testing.T) {
 		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ListFromCacheSnapshot, true)
 		ctx, s, c := setup(t)
@@ -240,6 +324,10 @@ func TestWatch(t *testing.T) {
 	} {
 		t.Run(name, simple(run))
 	}
+	t.Run("WatchError", func(t *testing.T) {
+		ctx, e := setupEnv(t)
+		storagetesting.RunTestWatchError(ctx, t, e)
+	})
 	t.Run("WatchFromZero", func(t *testing.T) {
 		ctx, s, c := setup(t)
 		storagetesting.RunTestWatchFromZero(ctx, t, s, compact(c))

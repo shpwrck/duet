@@ -13,20 +13,22 @@ This is the storage layer of kube-apiserver, not kube-apiserver itself.
 
 ## What runs
 
-36 entries of the suite (145 subtests): create, get, delete with
-preconditions and suggestions, guaranteed update and its conflict paths,
-objects with a TTL, lists (paging, continuation, continuation across a
-compaction, consistent list, namespace scoping), compaction, and watches
-(from zero, from a revision, delayed delivery, delete events, cluster and
-namespace scoped, cancel, timeout).
+44 entries of the suite: create, get, delete with preconditions and
+suggestions, guaranteed update and its conflict paths, objects with a
+TTL, the main list test (with plain and streamed ranges), paging,
+continuation, continuation across a compaction, consistent list,
+resource-version matching, namespace scoping, transformation failures,
+stats, compaction, and watches (from zero, from a revision, delayed
+delivery, delete events, errors, cluster and namespace scoped, cancel,
+timeout).
 
 ## What does not run
 
-- Tests that count etcd calls or swap the value transformer mid-test
-  (`RunTestList`, `RunTestStats`, `RunTestGuaranteedUpdate`, the
-  transformation-failure and corrupt-object tests). They need hooks into
-  the client that this harness does not build. `RunTestList` is the
-  largest gap.
+- The corrupt-object tests (`RunTestGetListWithErrorAggregation` and
+  relatives, `RunTestWatchWithUnsafeDelete`), which need a hook to make
+  decoding fail.
+- The checks that count etcd calls per list page
+  (`RunTestListContinuation` runs, but with call counting switched off).
 - Watch bookmark tests, which Kubernetes runs against its watch cache, not
   against etcd.
 - Anything during an ownership change. All of this runs against a stable

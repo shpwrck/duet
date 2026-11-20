@@ -1,6 +1,6 @@
 // Package api serves the etcd v3 gRPC API from a duet node.
 //
-// It covers what kube-apiserver uses: KV (Range, Put, DeleteRange, Txn,
+// It covers what kube-apiserver uses: KV (Range, RangeStream, Put, DeleteRange, Txn,
 // Compact), Watch, Lease (Grant, Revoke, KeepAlive) and Maintenance
 // Status. Auth, Cluster and the rest of Maintenance are not implemented.
 package api
@@ -15,6 +15,7 @@ import (
 	"go.etcd.io/etcd/server/v3/lease"
 	"go.etcd.io/etcd/server/v3/storage/mvcc"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -112,6 +113,30 @@ func (s *KV) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeResponse, 
 	}
 	resp.Header = s.header(resp.Header)
 	return resp, nil
+}
+
+// rangeChunk is how many keys one RangeStream message carries.
+const rangeChunk = 256
+
+// RangeStream answers a range in several messages, so that no single gRPC
+// message has to hold a large list. All messages come from one read at one
+// revision. The whole result is still assembled in memory first; only the
+// transport is chunked.
+func (s *KV) RangeStream(r *pb.RangeRequest, gs grpc.ServerStreamingServer[pb.RangeStreamResponse]) error {
+	resp, err := s.Range(gs.Context(), r)
+	if err != nil {
+		return err
+	}
+	kvs := resp.Kvs
+	for len(kvs) > rangeChunk {
+		if err := gs.Send(&pb.RangeStreamResponse{RangeResponse: &pb.RangeResponse{Kvs: kvs[:rangeChunk]}}); err != nil {
+			return err
+		}
+		kvs = kvs[rangeChunk:]
+	}
+	// Header, More and Count travel on the last message only.
+	resp.Kvs = kvs
+	return gs.Send(&pb.RangeStreamResponse{RangeResponse: resp})
 }
 
 func (s *KV) Put(ctx context.Context, r *pb.PutRequest) (*pb.PutResponse, error) {
