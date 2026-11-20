@@ -78,5 +78,27 @@ about 45 of 400 creates failed where etcd failed one. Now every node
 listens, and a node that does not own the log holds a call until the
 owner is reachable and then forwards it.
 
-Not exercised: controllers, scheduler, kubelets, any real workload, more
-than a few hundred objects, or any of this on separate machines.
+## A whole control plane, with simulated nodes
+
+`controlplane.sh` adds kube-controller-manager and kube-scheduler, with
+[kwok](https://kwok.sigs.k8s.io) standing in for the nodes. It rolls out a
+Deployment, then a second one during which the datastore's leader is
+killed, and waits for every pod to be Running. `lib.sh` holds the setup
+the scripts share.
+
+One run each on 20 Nov 2026, same machine and versions as above, 100
+simulated nodes and 3,000 pods per Deployment:
+
+| | duet, 2 nodes | etcd, 3 members |
+| --- | --- | --- |
+| 3,000 pods Running, no fault | 29 s | 35 s |
+| 3,000 more, leader killed 8 s in | 348 s | 296 s |
+| Pods Running at the end, of 6,000 | 6,000 | 6,000 |
+
+Both converge, and both take about ten times longer after a leader kill.
+Since etcd does too, the slowdown is on the Kubernetes side on this
+machine and has not been looked into. One run each is not enough to rank
+the two.
+
+Not exercised: real kubelets or workloads, more than 6,000 pods, or any
+of this on separate machines.
