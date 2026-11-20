@@ -19,9 +19,12 @@ import (
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"github.com/shpwrck/duet/pkg/disk"
 	"github.com/shpwrck/duet/pkg/lease"
 	"github.com/shpwrck/duet/pkg/node"
+	"github.com/shpwrck/duet/pkg/sm"
 	"github.com/shpwrck/duet/pkg/wal"
 )
 
@@ -62,8 +65,9 @@ type appendReq struct {
 }
 
 type appendResp struct {
-	index uint64
-	err   error
+	index  uint64
+	err    error
+	result sm.Result // set only when the node runs the etcd state machine
 }
 
 type status struct {
@@ -87,9 +91,23 @@ type server struct {
 	chain [32]byte   // hash chain over sums; equal chains mean equal logs
 	owner bool
 	epoch uint64
+
+	// etcd mode only.
+	st       *sm.Store
+	etcdAddr string
+	etcdSrv  *grpc.Server // non-nil only while this node is the owner
+	barriers chan chan error
+	collect  bool        // true while the loop is inside Append
+	results  []sm.Result // results of the batch being appended
 }
 
 func (s *server) apply(index uint64, payload []byte) {
+	if s.st != nil {
+		r := s.st.Apply(index, payload)
+		if s.collect {
+			s.results = append(s.results, r)
+		}
+	}
 	sum := sha256.Sum256(payload)
 	s.mu.Lock()
 	s.sums = append(s.sums, sum)
@@ -103,6 +121,7 @@ func (s *server) publish() {
 	s.owner, s.epoch = s.n.IsOwner(), s.n.Epoch()
 	now := s.owner
 	s.mu.Unlock()
+	s.followOwnership(now)
 	if now != was {
 		if now {
 			log.Printf("node %d: became owner of epoch %d", s.id, s.n.Epoch())
@@ -163,9 +182,15 @@ gather:
 	for i, r := range batch {
 		payloads[i] = r.payload
 	}
+	s.collect, s.results = true, s.results[:0]
 	idx, err := s.n.Append(payloads)
+	s.collect = false
 	for i, r := range batch {
-		r.resp <- appendResp{index: idx + uint64(i), err: err}
+		resp := appendResp{index: idx + uint64(i), err: err}
+		if err == nil && s.st != nil {
+			resp.result = s.results[i]
+		}
+		r.resp <- resp
 	}
 	s.publish()
 }
@@ -188,6 +213,8 @@ func (s *server) loop(ctx context.Context, tick time.Duration, campaign bool) {
 			return
 		case <-t.C:
 			s.maintain(campaign)
+		case b := <-s.barriers:
+			s.barrier(b)
 		case r := <-s.reqs:
 			s.write(r)
 			for s.carry != nil {
@@ -272,6 +299,8 @@ func cmdRun(args []string) error {
 	drift := fs.Float64("drift", 0.1, "bound on relative clock rate error between nodes")
 	direct := fs.Bool("direct", true, "use direct I/O (required when nodes are on different machines)")
 	campaign := fs.Bool("campaign", true, "stand for ownership; false makes a read-only follower")
+	etcdListen := fs.String("etcd", "", "address for the etcd v3 gRPC API; empty leaves it off and the log carries opaque payloads")
+	stateDir := fs.String("state-dir", "", "directory for the etcd state machine's files (rebuilt from the log at every start); default is the system temporary directory")
 	startDelay := fs.Duration("start-delay", time.Second, "wait before first touching the disk, so a previous process's last write has landed")
 	fs.Parse(args)
 
@@ -287,6 +316,14 @@ func cmdRun(args []string) error {
 		return err
 	}
 	s := &server{id: *id, l: l, reqs: make(chan *appendReq, 8192)}
+	if *etcdListen != "" {
+		if s.st, err = sm.Open(*stateDir); err != nil {
+			return err
+		}
+		defer s.st.Close()
+		s.barriers = make(chan chan error, 8192)
+		s.etcdAddr = *etcdListen
+	}
 	s.n, err = node.New(dev, realClock{time.Now()},
 		lease.Config{Node: *id, Incarnation: uint64(time.Now().UnixNano()), Drift: *drift}, s.apply)
 	if err != nil {

@@ -41,10 +41,11 @@ func freeAddr(t *testing.T) string {
 	return l.Addr().String()
 }
 
-func (c *cluster) start(id int, addr string) *proc {
+func (c *cluster) start(id int, addr string, extra ...string) *proc {
 	c.t.Helper()
 	cmd := exec.Command(c.bin, "run", "-device", c.device, "-node", fmt.Sprint(id),
 		"-listen", addr, "-start-delay", "200ms", c.direct)
+	cmd.Args = append(cmd.Args, extra...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		c.t.Fatal(err)
@@ -80,10 +81,10 @@ func (c *cluster) endpoints() string {
 	return strings.Join(urls, ",")
 }
 
-func TestPauseAndKillOwner(t *testing.T) {
-	if testing.Short() {
-		t.Skip("starts real processes; skipped with -short")
-	}
+// setup builds the binary and formats a shared image for three nodes with
+// a one-second lease.
+func setup(t *testing.T) (*cluster, string) {
+	t.Helper()
 	dir := t.TempDir()
 	c := &cluster{t: t, bin: filepath.Join(dir, "duet"), device: filepath.Join(dir, "disk.img"), direct: "-direct=true"}
 	if out, err := exec.Command("go", "build", "-o", c.bin, "github.com/shpwrck/duet/cmd/duet").CombinedOutput(); err != nil {
@@ -106,6 +107,14 @@ func TestPauseAndKillOwner(t *testing.T) {
 			t.Fatalf("format: %v\n%s", err, out)
 		}
 	}
+	return c, dir
+}
+
+func TestPauseAndKillOwner(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts real processes; skipped with -short")
+	}
+	c, dir := setup(t)
 	addrs := []string{freeAddr(t), freeAddr(t), freeAddr(t)}
 	for i, a := range addrs {
 		c.nodes = append(c.nodes, c.start(i, a))

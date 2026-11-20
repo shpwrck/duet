@@ -230,6 +230,21 @@ func (n *Node) Release() error {
 	return n.m.Release()
 }
 
+// Confirm reports whether this node still owned the log at some point
+// after the call began, by reading the disk. It is the check a
+// linearizable read needs.
+func (n *Node) Confirm() error {
+	if !n.IsOwner() {
+		n.w = nil
+		return ErrNotOwner
+	}
+	if err := n.m.Confirm(); err != nil || !n.m.Valid() {
+		n.w = nil
+		return ErrLeaseLost
+	}
+	return nil
+}
+
 // Append writes a batch and returns the index of its first record. A nil
 // error is the acknowledgement: the batch is durable and will be seen by
 // every future owner. ErrLeaseLost means the outcome is unknown to the
