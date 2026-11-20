@@ -113,6 +113,7 @@ func (s *server) followOwnership(owner bool) {
 		if s.etcdSrv != nil {
 			go s.etcdSrv.Stop()
 			s.etcdSrv = nil
+			s.st.Lessor().Demote()
 		}
 		return
 	}
@@ -125,11 +126,37 @@ func (s *server) followOwnership(owner bool) {
 		return
 	}
 	srv := grpc.NewServer()
-	pb.RegisterKVServer(srv, api.NewKV(etcdBackend{s}, 1, uint64(s.id+1)))
+	b, member := etcdBackend{s}, uint64(s.id+1)
+	kv := api.NewKV(b, 1, member)
+	pb.RegisterKVServer(srv, kv)
+	pb.RegisterWatchServer(srv, api.NewWatch(b, 1, member))
+	pb.RegisterLeaseServer(srv, api.NewLease(kv))
+	pb.RegisterMaintenanceServer(srv, api.NewMaintenance(kv))
+	// Leases count down only on the owner. A new owner gives every lease
+	// one more disk-lease period, since keep-alives sent to the old owner
+	// during the takeover were lost.
+	s.st.Lessor().Promote(s.l.TTL)
 	go func() {
 		if err := srv.Serve(lis); err != nil {
 			log.Printf("node %d: etcd API: %v", s.id, err)
 		}
 	}()
 	s.etcdSrv = srv
+}
+
+// expireLeases turns leases that have run out into revokes in the log, so
+// every replica deletes the attached keys at the same revision. The lessor
+// reports an expired lease again until it is revoked, so a failed attempt
+// is retried.
+func (s *server) expireLeases(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case leases := <-s.st.Lessor().ExpiredLeasesC():
+			for _, l := range leases {
+				etcdBackend{s}.Propose(ctx, &sm.Command{LeaseRevoke: &pb.LeaseRevokeRequest{ID: int64(l.ID)}})
+			}
+		}
+	}
 }

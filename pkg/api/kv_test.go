@@ -77,7 +77,11 @@ func start(t *testing.T, dev disk.Device, id int) (*backend, *clientv3.Client) {
 		t.Fatal(err)
 	}
 	srv := grpc.NewServer()
-	pb.RegisterKVServer(srv, api.NewKV(b, 1, uint64(id+1)))
+	kv := api.NewKV(b, 1, uint64(id+1))
+	pb.RegisterKVServer(srv, kv)
+	pb.RegisterWatchServer(srv, api.NewWatch(b, 1, uint64(id+1)))
+	pb.RegisterLeaseServer(srv, api.NewLease(kv))
+	pb.RegisterMaintenanceServer(srv, api.NewMaintenance(kv))
 	go srv.Serve(lis)
 	cli, err := clientv3.New(clientv3.Config{Endpoints: []string{lis.Addr().String()}, DialTimeout: 2 * time.Second})
 	if err != nil {
@@ -153,5 +157,119 @@ func TestEtcdClientAgainstDuet(t *testing.T) {
 	}
 	if _, err := c1.Get(short, key); err == nil {
 		t.Fatal("non-owner answered a linearizable read")
+	}
+}
+
+func oneNode(t *testing.T) (*backend, *clientv3.Client, context.Context) {
+	t.Helper()
+	lay := disk.Layout{Nodes: 2, EpochSlots: 16, LogSize: 4 << 20, TTL: 10 * time.Second, MaxBatch: 4 * disk.BlockSize}
+	dev := disk.NewMemDevice(lay.Total())
+	if err := disk.Format(dev, lay); err != nil {
+		t.Fatal(err)
+	}
+	b, c := start(t, dev, 0)
+	if err := b.n.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	b.st.Lessor().Promote(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.Cleanup(cancel)
+	return b, c, ctx
+}
+
+func next(t *testing.T, ch clientv3.WatchChan) clientv3.WatchResponse {
+	t.Helper()
+	select {
+	case r, ok := <-ch:
+		if !ok {
+			t.Fatal("watch channel closed")
+		}
+		return r
+	case <-time.After(5 * time.Second):
+		t.Fatal("no watch response within 5s")
+	}
+	return clientv3.WatchResponse{}
+}
+
+// A watch the way kube-apiserver opens one: a prefix, from a past
+// revision, with previous values, then a progress request.
+func TestWatch(t *testing.T) {
+	_, c, ctx := oneNode(t)
+	c.Put(ctx, "/registry/pods/a", "1") // rev 2
+	c.Put(ctx, "/registry/pods/a", "2") // rev 3
+	c.Put(ctx, "/registry/svc/x", "1")  // rev 4, outside the prefix
+
+	wctx := clientv3.WithRequireLeader(ctx)
+	ch := c.Watch(wctx, "/registry/pods/", clientv3.WithPrefix(), clientv3.WithRev(3), clientv3.WithPrevKV())
+	r := next(t, ch)
+	if len(r.Events) != 1 || string(r.Events[0].Kv.Value) != "2" || r.Events[0].PrevKv == nil || string(r.Events[0].PrevKv.Value) != "1" {
+		t.Fatalf("replay from revision 3: %+v", r.Events)
+	}
+	if _, err := c.Delete(ctx, "/registry/pods/a"); err != nil { // rev 5
+		t.Fatal(err)
+	}
+	r = next(t, ch)
+	if len(r.Events) != 1 || r.Events[0].Type != clientv3.EventTypeDelete || r.Events[0].Kv.ModRevision != 5 || string(r.Events[0].PrevKv.Value) != "2" {
+		t.Fatalf("delete event: %+v", r.Events)
+	}
+	if err := c.RequestProgress(wctx); err != nil {
+		t.Fatal(err)
+	}
+	if r = next(t, ch); !r.IsProgressNotify() || r.Header.Revision != 5 {
+		t.Fatalf("progress: %+v", r)
+	}
+
+	// Asking for history that has been compacted cancels the watch and
+	// says where history now starts.
+	if _, err := c.Compact(ctx, 4); err != nil {
+		t.Fatal(err)
+	}
+	r = next(t, c.Watch(ctx, "/registry/pods/", clientv3.WithPrefix(), clientv3.WithRev(2)))
+	if r.CompactRevision != 4 || r.Err() != rpctypes.ErrCompacted {
+		t.Fatalf("compacted watch: %+v err %v", r, r.Err())
+	}
+}
+
+// Leases the way kube-apiserver uses them for events: grant, attach,
+// expire. Plus keep-alive, revoke and status.
+func TestLeaseAndStatus(t *testing.T) {
+	b, c, ctx := oneNode(t)
+	// The owner turns expired leases into revokes in the log.
+	go func() {
+		for ls := range b.st.Lessor().ExpiredLeasesC() {
+			for _, l := range ls {
+				b.Propose(ctx, &sm.Command{LeaseRevoke: &pb.LeaseRevokeRequest{ID: int64(l.ID)}})
+			}
+		}
+	}()
+	short, err := c.Grant(ctx, 1)
+	if err != nil || short.ID == 0 {
+		t.Fatalf("grant: %v %+v", err, short)
+	}
+	long, err := c.Grant(ctx, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Put(ctx, "/registry/events/short", "e", clientv3.WithLease(short.ID))
+	c.Put(ctx, "/registry/events/long", "e", clientv3.WithLease(long.ID))
+	if ka, err := c.KeepAliveOnce(ctx, long.ID); err != nil || ka.TTL != 60 {
+		t.Fatalf("keep-alive: %v %+v", err, ka)
+	}
+	ch := c.Watch(ctx, "/registry/events/short")
+	if r := next(t, ch); len(r.Events) != 1 || r.Events[0].Type != clientv3.EventTypeDelete {
+		t.Fatalf("expected the expired lease to delete its key: %+v", r.Events)
+	}
+	if _, err := c.Revoke(ctx, long.ID); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := c.Get(ctx, "/registry/events/", clientv3.WithPrefix()); g.Count != 0 {
+		t.Fatalf("%d keys left after their leases ended", g.Count)
+	}
+	if _, err := c.Put(ctx, "/k", "v", clientv3.WithLease(long.ID)); err != rpctypes.ErrLeaseNotFound {
+		t.Fatalf("put with revoked lease: %v", err)
+	}
+	st, err := c.Status(ctx, c.Endpoints()[0])
+	if err != nil || st.Version != sm.EtcdVersion || st.DbSize == 0 {
+		t.Fatalf("status: %v %+v", err, st)
 	}
 }

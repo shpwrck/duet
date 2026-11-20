@@ -1,7 +1,8 @@
 // Package api serves the etcd v3 gRPC API from a duet node.
 //
-// So far: the KV service (Range, Put, DeleteRange, Txn, Compact). Watch,
-// Lease and Maintenance are not implemented yet.
+// It covers what kube-apiserver uses: KV (Range, Put, DeleteRange, Txn,
+// Compact), Watch, Lease (Grant, Revoke, KeepAlive) and Maintenance
+// Status. Auth, Cluster and the rest of Maintenance are not implemented.
 package api
 
 import (

@@ -94,6 +94,13 @@ func (s *Store) Lessor() lease.Lessor { return s.le }
 // Applied is the index of the last command applied.
 func (s *Store) Applied() uint64 { return s.applied }
 
+// EtcdVersion is the etcd release whose storage code this package runs,
+// reported to clients that ask which etcd they are talking to.
+const EtcdVersion = "3.7.4"
+
+// DbSize is the size of the store's database file in bytes.
+func (s *Store) DbSize() int64 { return s.be.Size() }
+
 // Revision is the store's current revision.
 func (s *Store) Revision() int64 { return s.kv.Rev() }
 

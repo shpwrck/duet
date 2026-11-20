@@ -342,6 +342,9 @@ func cmdRun(args []string) error {
 			log.Fatalf("node %d: %v", *id, err)
 		}
 	}()
+	if s.st != nil {
+		go s.expireLeases(ctx)
+	}
 	log.Printf("node %d: serving on %s, lease %s, direct=%v", *id, *listen, l.TTL, *direct)
 	s.loop(ctx, l.TTL/5, *campaign)
 	shutdown, cancel := context.WithTimeout(context.Background(), time.Second)
