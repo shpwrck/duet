@@ -194,9 +194,9 @@ unit() { if [ "$BACKEND" = duet ]; then echo duet-node; else echo etcd-member; f
 api_endpoints() { local out=""; for i in $(members); do out="$out${out:+,}${IP[$i]}:2379"; done; echo "$out"; }
 start_member() {
   if [ "$BACKEND" = duet ]; then
-    node "$1" "sudo systemctl reset-failed duet-node 2>/dev/null; sudo rm -rf /dev/shm/duet; sudo mkdir -p /dev/shm/duet; sudo systemd-run --unit duet-node --collect \
+    node "$1" "sudo systemctl reset-failed duet-node 2>/dev/null; sudo mkdir -p /var/lib/duet-lab; sudo systemd-run --unit duet-node --collect \
       /usr/local/bin/duet run -device $DEV -node $1 -listen 0.0.0.0:7000 -etcd 0.0.0.0:2379 \
-      -etcd-peers ${IP[0]}:2379,${IP[1]}:2379 -state-dir /dev/shm/duet -watch-progress-interval 5s"
+      -etcd-peers ${IP[0]}:2379,${IP[1]}:2379 -state-dir /var/lib/duet-lab -watch-progress-interval 5s"
   else
     node "$1" "sudo systemctl reset-failed etcd-member 2>/dev/null; sudo systemd-run --unit etcd-member --collect \
       /usr/local/bin/etcd --name m$1 --data-dir /var/lib/etcd-lab \
@@ -222,6 +222,7 @@ leader() { # index of the member that currently leads
 }
 
 api_results='[]'
+: > starts.txt
 api_scenario() { # api_scenario NAME SECONDS WORKERS FAULT_FUNCTION
   local name=$1 secs=$2 workers=$3 fault=$4 tag="$BACKEND-$1" first
   echo "=== api scenario: $BACKEND $name"
@@ -305,6 +306,9 @@ api_all_down() { # every member killed at once, started again ten seconds later
 for BACKEND in duet etcd; do
   if [ "$BACKEND" = duet ]; then
     node 0 "sudo duet format -device $DEV -nodes 2 -ttl $TTL -epoch-slots 1024 -max-batch 1048576 -checkpoint-size 2147483648"
+    # The etcd state file lives on each node's own disk, as etcd's does,
+    # and is kept across restarts of the process and of the VM.
+    for i in 0 1; do node "$i" "sudo rm -rf /var/lib/duet-lab /dev/shm/duet"; done
   fi
   for i in $(members); do start_member "$i"; done
   leader >/dev/null
@@ -317,7 +321,13 @@ for BACKEND in duet etcd; do
   api_scenario vm_suspend 120 8 api_vm_suspend
   api_scenario vm_reset 180 8 api_vm_reset
   api_scenario all_down 90 8 api_all_down
+  if [ "$BACKEND" = duet ]; then # how each start got its state: own disk, or a checkpoint read back
+    for i in 0 1; do
+      node "$i" "sudo journalctl -u duet-node --no-pager -o cat | grep -a 'continuing from local\|restored checkpoint' | cut -c1-160" | sed "s/^/start: /" >> starts.txt || true
+    done
+  fi
   for i in $(members); do node "$i" "sudo systemctl stop $(unit)" || true; done
+  if [ "$BACKEND" = duet ]; then for i in 0 1; do node "$i" "sudo rm -rf /var/lib/duet-lab" || true; done; fi
 done
 
 jq --arg ttl "$TTL" --argjson api "$api_results" --argjson probe "$probe" '{lease: $ttl, disk_probe: $probe, storage: "GCP Hyperdisk Balanced High Availability, multi-writer, two zones", scenarios: ., api: $api}' \
@@ -341,6 +351,10 @@ jq --arg ttl "$TTL" --argjson api "$api_results" --argjson probe "$probe" '{leas
   echo "| Backend | Scenario | Leader at start | Verified | Acknowledged | Errors | Writes/s | p50 ms | p99 ms | Longest gap ms |"
   echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
   jq -r '.api[] | "| \(.backend) | \(.scenario) | \(.leader_at_start) | \(.verified) | \(.load.acknowledged // "?") | \(.load.errors // "?") | \((.load.writes_per_second // 0) | floor) | \(.load.latency_ms_p50 // "?") | \(.load.latency_ms_p99 // "?") | \(.load.longest_gap_ms // "?") |"' results.json
+  echo
+  echo "How each duet process start got its state:"
+  echo
+  sed 's/^/    /' starts.txt 2>/dev/null || true
 } | tee summary.md
 
 jq -e 'all(.scenarios[]; .verified) and all(.api[]; .verified)' results.json >/dev/null
