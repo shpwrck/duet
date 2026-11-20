@@ -282,7 +282,7 @@ GKE or EKS scale needs a load test at that scale.
 | 0 | Platform spike on a two-host vSAN cluster: A1 to A3, flush latency, reservation commands from Linux | Results table; go or no-go per ownership backend |
 | 1 | Baselines on the same disk: vSphere HA restart, Pacemaker with stock etcd | Recovery numbers; gate decision |
 | 2 | Ownership and log | **Done in simulation.** TLA+ model still to write. |
-| 3 | State machine and etcd API; checkpoints and trimming | kube-apiserver runs; upstream storage tests pass. **State: API, state machine and checkpoints done; most upstream storage tests pass (`test/kube`); kube-apiserver not yet run; no trimming.** |
+| 3 | State machine and etcd API; checkpoints and trimming | kube-apiserver runs; upstream storage tests pass. **State: API, state machine and checkpoints done; most upstream storage tests pass and kube-apiserver v1.37.2 runs through an owner kill (`test/kube`); no trimming; followers do not serve.** |
 | 4 | Correctness harness on real processes and disks | Linearizability checker passes under faults |
 | 5 | Kubernetes demo on the lab and on vSAN | Conformance; recovery benchmark against milestone 1 |
 | 6 | Scale: partitions, in-memory state, load tests against the targets above | Measured throughput per partition; gap to targets stated |

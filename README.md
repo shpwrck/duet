@@ -17,8 +17,9 @@ the log is a shared disk.
 simulation, as real processes on one machine, and on two Google Cloud VMs
 sharing a replicated disk. The stock etcd client works against it across an
 owner failure, and Kubernetes' storage layer passes most of its own test
-suite against it. kube-apiserver itself has not been run against it, the
-log is never trimmed, and nothing has run on vSAN. See
+suite against it. A real kube-apiserver has run against it on one machine,
+through an owner failure. No controllers, kubelets or workloads have; the
+log is never trimmed; and nothing has run on vSAN. See
 [what exists](#what-exists-today) before drawing conclusions.
 
 ## How it works
@@ -51,7 +52,7 @@ safety argument.
 | `duet` process: direct I/O, real clock, renewal loop, group commit (`cmd/duet`) | Implemented, with a temporary HTTP interface for testing |
 | Process-level fault test (`test/proc`) | Implemented: owner frozen and killed under load |
 | State machine: etcd's own storage, transaction and lease code driven by the log (`pkg/sm`) | Implemented |
-| etcd v3 gRPC API: KV, Watch, Lease, Maintenance Status (`pkg/api`, `duet run -etcd`) | Implemented for what kube-apiserver uses; passes the part of Kubernetes' own storage test suite listed in [test/kube](test/kube/README.md); kube-apiserver itself has not been run. Only the owner serves |
+| etcd v3 gRPC API: KV, Watch, Lease, Maintenance Status (`pkg/api`, `duet run -etcd`) | Implemented for what kube-apiserver uses; passes the part of Kubernetes' own storage test suite listed in [test/kube](test/kube/README.md); a real kube-apiserver (v1.37.2) ran against it through an owner kill with no acknowledged write lost. Only the owner serves, which delays clients after a handover |
 | Checkpoints (`pkg/ckpt`) | Implemented: any node writes them, a restart loads the newest and replays the rest |
 | Log trimming, epoch table reuse | Not started; the log fills up and stops |
 | SCSI-3 reservation backend | Not started |
