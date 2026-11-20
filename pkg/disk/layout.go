@@ -14,7 +14,7 @@ const BlockSize = 4096
 const (
 	superMagic   = 0x44554554 // "DUET"
 	blockMagic   = 0x64626c6b // "dblk"
-	formatVer    = 1
+	formatVer    = 2
 	payloadLimit = BlockSize - 12 // magic + length + crc
 )
 
@@ -63,8 +63,21 @@ func (l Layout) PaxosOff(node int) int64 { return BlockSize * int64(1+l.Nodes+no
 func (l Layout) SlotOff(epoch uint64) int64 {
 	return BlockSize * (int64(1+2*l.Nodes) + int64(epoch-1))
 }
-func (l Layout) LogStart() int64 { return BlockSize * int64(1+2*l.Nodes+l.EpochSlots) }
-func (l Layout) LogEnd() int64   { return l.LogStart() + l.LogSize }
+
+// TrimOff is a node's trim block: what it promises about its own past
+// writes and how much of the log it knows to be covered by a checkpoint.
+func (l Layout) TrimOff(node int) int64 {
+	return BlockSize * (int64(1+2*l.Nodes+l.EpochSlots) + int64(node))
+}
+func (l Layout) LogStart() int64 { return BlockSize * int64(1+3*l.Nodes+l.EpochSlots) }
+
+// LogPhys maps a logical log offset to its place on the device. Logical
+// offsets start at LogStart and only grow; the log region is reused in
+// laps, so an offset one LogSize further on lands on the same bytes.
+func (l Layout) LogPhys(off int64) int64 {
+	return l.LogStart() + (off-l.LogStart())%l.LogSize
+}
+func (l Layout) LogEnd() int64 { return l.LogStart() + l.LogSize }
 
 // CkptOff is where one of a node's two checkpoint slots starts.
 func (l Layout) CkptOff(node, slot int) int64 {

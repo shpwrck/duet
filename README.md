@@ -54,7 +54,8 @@ safety argument.
 | State machine: etcd's own storage, transaction and lease code driven by the log (`pkg/sm`) | Implemented |
 | etcd v3 gRPC API: KV, Watch, Lease, Maintenance Status (`pkg/api`, `duet run -etcd`) | Implemented for what kube-apiserver uses; passes the part of Kubernetes' own storage test suite listed in [test/kube](test/kube/README.md); a real kube-apiserver (v1.37.2) ran against it through an owner kill with no acknowledged write lost. Nodes that do not own the log forward to the one that does; they do not serve reads themselves |
 | Checkpoints (`pkg/ckpt`) | Implemented: any node writes them, a restart loads the newest and replays the rest |
-| Log trimming, epoch table reuse | Not started; the log fills up and stops |
+| Log reuse (`pkg/trim`, `pkg/node`) | Implemented and tested in simulation, with mutation tests; not wired into the binary, where the log still fills up and stops |
+| Epoch table reuse | Not planned; one slot per ownership change, sized at format time |
 | SCSI-3 reservation backend | Not started |
 | TLA+ model | Not started |
 | Google Cloud lab (`deploy/lab-gcp`) | Run six times; results, including the comparison with three-member etcd, in [docs/LAB-RUNS.md](docs/LAB-RUNS.md) |

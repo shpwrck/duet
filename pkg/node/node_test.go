@@ -277,7 +277,7 @@ func TestReaderHoldsWhileBallotInProgress(t *testing.T) {
 		// B has computed the cutoff and is about to accept its value. Now
 		// A's in-flight write lands, past the cutoff, and C reads the log.
 		fired = true
-		stale := wal.NewWriter(w.disk, w.lay, 1, a.n.off, a.n.next)
+		stale := wal.NewWriter(w.disk, w.lay, 1, a.n.off, a.n.next, w.lay.LogEnd())
 		if _, err := stale.Append([][]byte{[]byte("stale")}); err != nil {
 			t.Fatal(err)
 		}

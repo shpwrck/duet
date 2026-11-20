@@ -30,6 +30,7 @@ block 0              superblock: node count, epoch slots, log size, TTL, max bat
 blocks 1 .. N        lease block per node
 blocks N+1 .. 2N     Disk Paxos block per node
 next E blocks        epoch table: slot e-1 describes epoch e
+next N blocks        trim block per node
 next L bytes         log
 last 2N slots        checkpoints: two per node (optional)
 ```
@@ -160,7 +161,7 @@ A state larger than a checkpoint slot cannot be checkpointed; the node
 logs the failure and carries on. On Kubernetes-sized state the copy will
 compete with the log for disk throughput, and that has not been measured.
 
-## Trimming (design; not implemented)
+## Trimming (in the library and the simulation; the binary does not trim yet)
 
 The log has to be reused, or it fills. The plan is a circular log:
 positions stay as ever-growing logical offsets in epoch records, cursors
@@ -250,15 +251,47 @@ hazard for ballot participants and is deferred. One slot is used per
 ownership change, so the limit is the number of failovers over the life
 of the disk: 65,536 slots cost 256 MiB.
 
-**Open points before coding.**
+**What is built.** `pkg/trim` and `pkg/node` implement this with one
+trim block per node, written only by that node, holding two numbers that
+only grow: the epoch up to which it will never write again, and the head
+it vouches for.
 
-- A reader that must restart from a checkpoint while the only checkpoint
-  at or beyond the head is being replaced has to wait for the new one.
-- The head must be re-read by a restarting node from all lease blocks
-  before it writes its own, or heads could go backwards.
-- This changes rules that the simulation and the mutation tests cover.
-  It gets implemented in the simulation first, with wrap-around in the
-  random schedules, before the binary uses it.
+- A node retires an epoch when it reads past it into the next one, and
+  retires every epoch on disk when it starts. Losing the lease is not
+  enough: an owner that saw a ballot can resume the same epoch if the
+  ballot is withdrawn, so only a later epoch on disk closes one.
+- The owner may write up to `min(head, start of the block holding the
+  cutoff of the oldest unretired epoch) + log size`. The late write was
+  not on disk when the cutoff was measured, so it starts at or after the
+  cutoff, and writes are whole blocks.
+- Any node may publish a head for a position it has reached, so a
+  follower can take the checkpoint and free the space.
+- Every read of the log is followed by a read of the heads. A node that
+  finds the head beyond where it started reading gets `ErrLapped` and
+  must start again from a checkpoint as a new incarnation, which is also
+  what retires its old epochs.
+- `trim.DeclareDead` is the outside declaration for a node that never
+  runs again.
+
+**How it is tested.** In the simulation, on logs of 32 to 48 blocks: the
+log filling and continuing once a head is published; eight laps with
+ownership changing hands every 40 writes; a deposed owner whose write
+lands after the new owner has gone round, with both ways of retiring it;
+an overtaken reader; a head surviving restart; and 300 random schedules
+of writes, takeovers, restarts and trims averaging 6.7 laps each. Nine
+mutations of the new rules (ignore unretired gaps, ignore the head, skip
+the reader's check, and so on) are each caught by at least one test. The
+random schedules do not inject late writes; that rule rests on the one
+directed test.
+
+**Not done.**
+
+- The binary never publishes a head, so in practice the log still fills
+  and stops. Wiring it in means: publish after a checkpoint, exit on
+  `ErrLapped` so the supervisor restarts the node, and a `retire` command.
+- A reader that must restart while the only checkpoint at or beyond the
+  head is being replaced has to wait for the new one.
+- The vCenter-confirmed retire controller does not exist.
 
 ## Decisions made
 

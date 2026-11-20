@@ -8,6 +8,7 @@ import (
 
 	"github.com/shpwrck/duet/pkg/disk"
 	"github.com/shpwrck/duet/pkg/lease"
+	"github.com/shpwrck/duet/pkg/trim"
 	"github.com/shpwrck/duet/pkg/wal"
 )
 
@@ -15,6 +16,10 @@ var (
 	ErrNotOwner  = errors.New("node: not the owner")
 	ErrLeaseLost = errors.New("node: lease lost before the write could be acknowledged")
 	ErrCorrupt   = errors.New("node: log does not match the epoch table")
+	// ErrLapped means the part of the log this node needs next may have
+	// been reused. The process must start again from a checkpoint, as a
+	// new incarnation; starting is also what retires its earlier epochs.
+	ErrLapped = errors.New("node: the log has been trimmed past this node's position")
 )
 
 // ApplyFunc receives every record in log order, exactly once per Node.
@@ -35,6 +40,11 @@ type Node struct {
 	next    uint64
 
 	w *wal.Writer // non-nil only while this node believes it is the owner
+
+	cfg          lease.Config
+	safeEpoch    uint64 // this node will not write for epochs up to here
+	head         int64  // the head this node has published
+	retiredFloor uint64 // every epoch up to here is known to be retired
 }
 
 // New returns a Node. apply may be nil.
@@ -50,7 +60,149 @@ func New(dev disk.Device, clock lease.Clock, cfg lease.Config, apply ApplyFunc) 
 	if apply == nil {
 		apply = func(uint64, []byte) {}
 	}
-	return &Node{dev: dev, l: l, m: m, apply: apply}, nil
+	n := &Node{dev: dev, l: l, m: m, apply: apply, cfg: cfg}
+	return n, n.announce()
+}
+
+// announce writes this incarnation's trim block. A process that has just
+// started has no write in flight for any epoch on the disk, so it can
+// promise never to write for any of them. It carries the furthest
+// published head forward so that heads never go backwards.
+func (n *Node) announce() error {
+	head, err := trim.Head(n.dev, n.l)
+	if err != nil {
+		return err
+	}
+	latest, have, err := n.m.Latest()
+	if err != nil {
+		return err
+	}
+	if have {
+		n.safeEpoch = latest.Epoch
+	}
+	n.head = head
+	return n.writeTrim()
+}
+
+func (n *Node) writeTrim() error {
+	return trim.Write(n.dev, n.l, n.cfg.Node, trim.Block{Incarnation: n.cfg.Incarnation, SafeEpoch: n.safeEpoch, Head: n.head})
+}
+
+// retire records that this node will never write for epoch e again. It is
+// called only once a later epoch is on disk, which closes e for good, and
+// from the node's one loop, so no write for e is still to be issued.
+func (n *Node) retire(e uint64) {
+	if e <= n.safeEpoch {
+		return
+	}
+	n.safeEpoch = e
+	// Best effort: if this write fails, log space is reclaimed later, not
+	// unsafely.
+	_ = n.writeTrim()
+}
+
+// scan is wal.Scan followed by a look at the published heads. The order
+// matters: a writer publishes a head before it overwrites anything below
+// it, so a reader that finds the head still at or behind where it started
+// knows that what it read had not been overwritten.
+func (n *Node) scan(epoch uint64, off int64, index uint64, limit int64, fn func(wal.Record)) (int64, uint64, error) {
+	var recs []wal.Record
+	end, next, err := wal.Scan(n.dev, n.l, epoch, off, index, limit, func(r wal.Record) { recs = append(recs, r) })
+	if err != nil {
+		return off, index, err
+	}
+	head, err := trim.Head(n.dev, n.l)
+	if err != nil {
+		return off, index, err
+	}
+	if head > off {
+		return off, index, ErrLapped
+	}
+	if fn != nil {
+		for _, r := range recs {
+			fn(r)
+		}
+	}
+	return end, next, nil
+}
+
+// writeLimit is the logical offset the owner of epoch e must stay below.
+// Space one lap back may be reused only if a checkpoint covers it (the
+// head) and no deposed owner can still have a late write aimed at it: the
+// stretch around the cutoff of every earlier epoch stays off limits until
+// that epoch's owner has retired it. cutoff is the cutoff of epoch e-1
+// when e is not on disk yet, and negative otherwise.
+func (n *Node) writeLimit(e uint64, cutoff int64) (int64, error) {
+	reuse, err := trim.Head(n.dev, n.l)
+	if err != nil {
+		return 0, err
+	}
+	for old := n.retiredFloor + 1; old < e; old++ {
+		rec, st, err := n.m.ReadSlot(old)
+		if err != nil {
+			return 0, err
+		}
+		if st != disk.BlockValid {
+			return 0, fmt.Errorf("%w: epoch %d missing from the table", ErrCorrupt, old)
+		}
+		retired := rec.Owner == n.cfg.Node // our own past epochs: this loop is not writing them
+		if !retired {
+			if retired, err = trim.Retired(n.dev, n.l, rec.Owner, old); err != nil {
+				return 0, err
+			}
+		}
+		if retired {
+			if old == n.retiredFloor+1 {
+				n.retiredFloor = old
+			}
+			continue
+		}
+		end := cutoff
+		if old+1 < e || cutoff < 0 {
+			next, st, err := n.m.ReadSlot(old + 1)
+			if err != nil {
+				return 0, err
+			}
+			if st != disk.BlockValid {
+				return 0, fmt.Errorf("%w: epoch %d missing from the table", ErrCorrupt, old+1)
+			}
+			end = next.PrevEndOffset
+		}
+		// The late write was not on disk when the cutoff was measured, so
+		// it starts at or after the cutoff; writes are whole blocks, so
+		// nothing from the cutoff's own block onwards may be reused.
+		zone := end &^ (disk.BlockSize - 1)
+		if zone < n.l.LogStart() {
+			zone = n.l.LogStart()
+		}
+		if zone < reuse {
+			reuse = zone
+		}
+	}
+	return reuse + n.l.LogSize, nil
+}
+
+// Trim publishes that a checkpoint covers the log up to off, which lets
+// the owner reuse the space before it. The caller must have that
+// checkpoint safely on disk: after this, a node that needs anything before
+// off can only get it from a checkpoint. Any node may call it, for a
+// position it has itself reached.
+func (n *Node) Trim(off int64) error {
+	if !n.started || off > n.off {
+		return errors.New("node: Trim beyond what this node has read")
+	}
+	head, err := trim.Head(n.dev, n.l)
+	if err != nil {
+		return err
+	}
+	if off > head {
+		head = off
+	}
+	if head <= n.head {
+		return nil
+	}
+	n.head = head
+	return n.writeTrim()
 }
 
 // Cursor is a position in the log: everything before it has been applied.
@@ -139,7 +291,7 @@ func (n *Node) Tail() error {
 			end     int64
 		}
 		var got []rec
-		end, next, err := wal.Scan(n.dev, n.l, n.cur.Epoch, n.off, n.next, -1, func(r wal.Record) {
+		end, next, err := n.scan(n.cur.Epoch, n.off, n.next, -1, func(r wal.Record) {
 			got = append(got, rec{r.Index, r.Payload, r.End})
 		})
 		if err != nil {
@@ -162,7 +314,7 @@ func (n *Node) Tail() error {
 			if n.off < nxt.PrevEndOffset {
 				// Records landed between our scan and the cutoff scan.
 				var scanErr error
-				n.off, n.next, scanErr = wal.Scan(n.dev, n.l, n.cur.Epoch, n.off, n.next, nxt.PrevEndOffset, func(r wal.Record) {
+				n.off, n.next, scanErr = n.scan(n.cur.Epoch, n.off, n.next, nxt.PrevEndOffset, func(r wal.Record) {
 					n.apply(r.Index, r.Payload)
 				})
 				if scanErr != nil {
@@ -172,6 +324,11 @@ func (n *Node) Tail() error {
 			if n.off != nxt.PrevEndOffset || n.next != nxt.StartIndex {
 				return fmt.Errorf("%w: epoch %d ends at offset %d index %d, table says %d and %d",
 					ErrCorrupt, n.cur.Epoch, n.off, n.next, nxt.PrevEndOffset, nxt.StartIndex)
+			}
+			if n.cur.Owner == n.cfg.Node && n.cur.Incarnation == n.cfg.Incarnation {
+				// We owned the epoch that has just been closed.
+				n.w = nil
+				n.retire(n.cur.Epoch)
 			}
 			n.cur, n.off, n.next = nxt, nxt.StartOffset, nxt.StartIndex
 			continue
@@ -213,7 +370,7 @@ func (n *Node) Campaign() error {
 		if n.started && n.cur.Epoch == prev.Epoch {
 			off, idx = n.off, n.next
 		}
-		end, nextIdx, err := wal.Scan(n.dev, n.l, prev.Epoch, off, idx, -1, nil)
+		end, nextIdx, err := n.scan(prev.Epoch, off, idx, -1, nil)
 		if err != nil {
 			return lease.EpochRecord{}, err
 		}
@@ -223,7 +380,11 @@ func (n *Node) Campaign() error {
 		// cutoff, and is at most MaxBatch long. MaxBatch is a whole number
 		// of blocks, so that write ends at or before this start.
 		start := disk.AlignUp(end + int64(n.l.MaxBatch))
-		if start+int64(n.l.MaxBatch) > n.l.LogEnd() {
+		limit, err := n.writeLimit(prev.Epoch+1, end)
+		if err != nil {
+			return lease.EpochRecord{}, err
+		}
+		if start+int64(n.l.MaxBatch) > limit {
 			return lease.EpochRecord{}, wal.ErrLogFull
 		}
 		return lease.EpochRecord{StartIndex: nextIdx, StartOffset: start, PrevEndOffset: end}, nil
@@ -250,13 +411,20 @@ func (n *Node) Campaign() error {
 	// record of this epoch on disk is part of history, including any we
 	// wrote earlier but could not acknowledge. Other nodes may already have
 	// applied them. Apply them too and continue after them; never overwrite.
-	n.off, n.next, err = wal.Scan(n.dev, n.l, rec.Epoch, n.off, n.next, -1, func(r wal.Record) {
+	if rec.Epoch <= n.safeEpoch {
+		return fmt.Errorf("%w: won epoch %d after promising not to write up to %d", ErrCorrupt, rec.Epoch, n.safeEpoch)
+	}
+	n.off, n.next, err = n.scan(rec.Epoch, n.off, n.next, -1, func(r wal.Record) {
 		n.apply(r.Index, r.Payload)
 	})
 	if err != nil {
 		return err
 	}
-	n.w = wal.NewWriter(n.dev, n.l, rec.Epoch, n.off, n.next)
+	limit, err := n.writeLimit(rec.Epoch, -1)
+	if err != nil {
+		return err
+	}
+	n.w = wal.NewWriter(n.dev, n.l, rec.Epoch, n.off, n.next, limit)
 	return nil
 }
 
@@ -300,6 +468,18 @@ func (n *Node) Append(batch [][]byte) (uint64, error) {
 		return 0, ErrNotOwner
 	}
 	first, err := n.w.Append(batch)
+	if errors.Is(err, wal.ErrLogFull) {
+		// Nothing was written. More space may have become reusable since
+		// the limit was last worked out.
+		limit, lerr := n.writeLimit(n.cur.Epoch, -1)
+		if lerr != nil {
+			return 0, lerr
+		}
+		n.w.SetLimit(limit)
+		if first, err = n.w.Append(batch); errors.Is(err, wal.ErrLogFull) {
+			return 0, err
+		}
+	}
 	if err != nil {
 		// Part of the batch may be on disk. Drop the writer so the next
 		// Campaign rescans from the cursor instead of overwriting it.

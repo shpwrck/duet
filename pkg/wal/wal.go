@@ -1,8 +1,9 @@
 // Package wal is the record log on the shared disk.
 //
-// The log is one byte range. Each ownership epoch writes a contiguous run
-// of records inside it, starting at the offset recorded for that epoch in
-// the epoch table. Records carry their epoch and index, so a reader can
+// The log is one region of the disk, used in laps: offsets are logical,
+// only ever grow, and map onto the region modulo its size. Each ownership
+// epoch writes a contiguous run of records, starting at the offset
+// recorded for that epoch in the epoch table. Records carry their epoch and index, so a reader can
 // tell a record that belongs where it sits from anything else.
 package wal
 
@@ -55,6 +56,31 @@ func encode(dst []byte, epoch, index uint64, payload []byte) []byte {
 	return dst
 }
 
+// ring gives the log region logical addressing: offsets only grow, and
+// map onto the region modulo its size. A read or write that crosses the
+// end of the region continues at its start.
+type ring struct {
+	dev disk.Device
+	l   disk.Layout
+}
+
+func (r ring) do(p []byte, off int64, op func([]byte, int64) (int, error)) error {
+	for len(p) > 0 {
+		phys := r.l.LogPhys(off)
+		n := int64(len(p))
+		if room := r.l.LogEnd() - phys; n > room {
+			n = room
+		}
+		if _, err := op(p[:n], phys); err != nil {
+			return err
+		}
+		p, off = p[n:], off+n
+	}
+	return nil
+}
+func (r ring) readAt(p []byte, off int64) error  { return r.do(p, off, r.dev.ReadAt) }
+func (r ring) writeAt(p []byte, off int64) error { return r.do(p, off, r.dev.WriteAt) }
+
 // window is a read-ahead buffer over the log, so that a scan costs one
 // device read per chunk instead of two per record.
 type window struct {
@@ -70,9 +96,9 @@ const (
 	windowMax = 1 << 20
 )
 
-// bytes returns n bytes at off, or nil if that range is outside the log.
+// bytes returns n bytes at logical offset off, or nil before the log's start.
 func (w *window) bytes(off int64, n int) ([]byte, error) {
-	if off < w.l.LogStart() || off+int64(n) > w.l.LogEnd() {
+	if off < w.l.LogStart() {
 		return nil, nil
 	}
 	if off < w.start || off+int64(n) > w.start+int64(len(w.buf)) {
@@ -87,11 +113,11 @@ func (w *window) bytes(off int64, n int) ([]byte, error) {
 		if w.next < windowMax {
 			w.next *= 2 // a short scan stays cheap, a long replay reads big chunks
 		}
-		if start+size > w.l.LogEnd() {
-			size = w.l.LogEnd() - start
+		if size > w.l.LogSize {
+			size = w.l.LogSize
 		}
 		buf := make([]byte, size)
-		if _, err := w.dev.ReadAt(buf, start); err != nil {
+		if err := (ring{w.dev, w.l}).readAt(buf, start); err != nil {
 			return nil, err
 		}
 		w.start, w.buf = start, buf
@@ -111,7 +137,7 @@ func (w *window) readRecord(off int64, epoch, index uint64) (Record, bool, error
 		return Record{}, false, nil
 	}
 	n := int(binary.LittleEndian.Uint32(h[4:]))
-	if n > w.l.MaxBatch || off+EncodedLen(n) > w.l.LogEnd() {
+	if n > w.l.MaxBatch {
 		return Record{}, false, nil
 	}
 	if binary.LittleEndian.Uint64(h[8:]) != epoch || binary.LittleEndian.Uint64(h[16:]) != index {
@@ -173,12 +199,18 @@ type Writer struct {
 	epoch uint64
 	off   int64
 	next  uint64
+	limit int64
 }
 
-// NewWriter returns a writer positioned at the start of an epoch.
-func NewWriter(dev disk.Device, l disk.Layout, epoch uint64, off int64, index uint64) *Writer {
-	return &Writer{dev: dev, l: l, epoch: epoch, off: off, next: index}
+// NewWriter returns a writer positioned at the start of an epoch. It will
+// not write at or beyond limit; see SetLimit.
+func NewWriter(dev disk.Device, l disk.Layout, epoch uint64, off int64, index uint64, limit int64) *Writer {
+	return &Writer{dev: dev, l: l, epoch: epoch, off: off, next: index, limit: limit}
 }
+
+// SetLimit moves the logical offset the writer must stay below. The owner
+// of the log raises it as older parts of the log become safe to reuse.
+func (w *Writer) SetLimit(limit int64) { w.limit = limit }
 
 // Append writes a batch of records with one device write and one sync. This
 // is the group commit: throughput is batches per second times batch size.
@@ -195,7 +227,7 @@ func (w *Writer) Append(batch [][]byte) (uint64, error) {
 	if padded > int64(w.l.MaxBatch) {
 		return 0, ErrTooLarge
 	}
-	if start+padded > w.l.LogEnd() {
+	if start+padded > w.limit {
 		return 0, ErrLogFull
 	}
 	buf := make([]byte, 0, padded)
@@ -203,7 +235,7 @@ func (w *Writer) Append(batch [][]byte) (uint64, error) {
 		buf = encode(buf, w.epoch, w.next+uint64(i), p)
 	}
 	buf = buf[:padded] // zero padding to the block boundary
-	if _, err := w.dev.WriteAt(buf, start); err != nil {
+	if err := (ring{w.dev, w.l}).writeAt(buf, start); err != nil {
 		return 0, err
 	}
 	if err := w.dev.Sync(); err != nil {
