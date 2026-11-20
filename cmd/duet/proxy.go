@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
@@ -160,11 +162,23 @@ type forwarder struct {
 // retry, which is right while an owner is being chosen.
 var errNoOwner = grpcstatus.Error(codes.Unavailable, "duet: no owner to forward to yet")
 
+// conn returns a ready connection to the node believed to own the log.
+// It waits a little for there to be one, instead of failing calls that
+// arrive during a takeover or just after this node started: nothing has
+// been sent yet, so waiting is safe, and to the client it looks like a
+// slow call, which is what an etcd member does during an election.
 func (f *forwarder) conn(ctx context.Context) (*grpc.ClientConn, error) {
-	// Wait a little for an owner to be known instead of failing calls
-	// that arrive during a takeover or just after this node started.
-	o := f.owner()
-	for deadline := time.Now().Add(f.wait); o < 0 || o >= len(f.peers) || o == f.self; o = f.owner() {
+	for deadline := time.Now().Add(f.wait); ; {
+		var c *grpc.ClientConn
+		if o := f.owner(); o >= 0 && o < len(f.peers) && o != f.self {
+			c = f.dial(o)
+		}
+		if c != nil {
+			if c.GetState() == connectivity.Ready {
+				return c, nil
+			}
+			c.Connect()
+		}
 		if time.Now().After(deadline) {
 			return nil, errNoOwner
 		}
@@ -174,18 +188,23 @@ func (f *forwarder) conn(ctx context.Context) (*grpc.ClientConn, error) {
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
+}
+
+func (f *forwarder) dial(o int) *grpc.ClientConn {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if c := f.conns[o]; c != nil {
-		return c, nil
+		return c
 	}
+	// Reconnect quickly: a peer that was down is expected back.
 	c, err := grpc.NewClient(f.peers[o], grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(rawCodec{})))
+		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(rawCodec{})),
+		grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoff.Config{BaseDelay: 50 * time.Millisecond, Multiplier: 1.5, MaxDelay: 500 * time.Millisecond}, MinConnectTimeout: time.Second}))
 	if err != nil {
-		return nil, errNoOwner
+		return nil
 	}
 	f.conns[o] = c
-	return c, nil
+	return c
 }
 
 func (f *forwarder) handle(_ any, ss grpc.ServerStream) error {
