@@ -283,13 +283,6 @@ func (m *Manager) Latest() (EpochRecord, bool, error) {
 // not trust records it read from epoch e until the next slot tells it where
 // e was cut off.
 func (m *Manager) NextEpochStirring(e uint64) (bool, error) {
-	_, st, err := m.readSlot(e + 1)
-	if err != nil {
-		return false, err
-	}
-	if st != disk.BlockEmpty {
-		return true, nil
-	}
 	for j := 0; j < m.l.Nodes; j++ {
 		pb, st, err := m.readPaxos(j)
 		if err != nil {
@@ -299,7 +292,12 @@ func (m *Manager) NextEpochStirring(e uint64) (bool, error) {
 			return true, nil
 		}
 	}
-	return false, nil
+	// The slot last, for the reason given in fence.
+	_, st, err := m.readSlot(e + 1)
+	if err != nil {
+		return false, err
+	}
+	return st != disk.BlockEmpty, nil
 }
 
 // ---- owner side ----
@@ -326,12 +324,6 @@ func (m *Manager) Renew() error {
 // fence reads the disk for any sign that a later epoch exists or is being
 // decided. It is the read half of the owner's write-then-read handshake.
 func (m *Manager) fence() error {
-	if _, st, err := m.readSlot(m.owned.Epoch + 1); err != nil {
-		return err
-	} else if st != disk.BlockEmpty {
-		m.lost = true
-		return ErrLeaseLost
-	}
 	unclean := false
 	for j := 0; j < m.l.Nodes; j++ {
 		if j == m.cfg.Node {
@@ -349,6 +341,20 @@ func (m *Manager) fence() error {
 			m.lost = true
 			return ErrLeaseLost
 		}
+	}
+	// The slot is read last, and the order matters. These are separate
+	// reads and this node may stall between them. A ballot block that
+	// showed a later epoch can be wiped again (retreat), but a node only
+	// moves on to the epoch after, where that can happen, once the slot
+	// for this one is written. So a ballot that fixed a cutoff is visible
+	// either in its block when that is read, or in the slot afterwards.
+	// Reading the slot first leaves a gap: see
+	// TestOwnerStalledBetweenTheReadsOfItsCheck.
+	if _, st, err := m.readSlot(m.owned.Epoch + 1); err != nil {
+		return err
+	} else if st != disk.BlockEmpty {
+		m.lost = true
+		return ErrLeaseLost
 	}
 	if unclean {
 		return ErrUnclean

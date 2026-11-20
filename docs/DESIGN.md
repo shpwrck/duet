@@ -78,8 +78,9 @@ re-read in rule 4 passed. From that point the old owner can acknowledge
 nothing new.
 
 **Rule 6, confirm after write.** After a batch is flushed, the owner reads
-the other nodes' ballot blocks and the next epoch slot. It acknowledges the
-batch only if there is no sign of a later epoch. This read uses no clock.
+the other nodes' ballot blocks and then the next epoch slot, in that
+order. It acknowledges the batch only if there is no sign of a later
+epoch. This read uses no clock.
 
 **Rule 7, gap between epochs.** A new epoch starts on the block boundary
 one maximum batch past the cutoff. A writer has at most one batch in flight, and it lands within
@@ -87,7 +88,7 @@ one batch of the cutoff, so a deposed writer's last write cannot touch the
 new epoch.
 
 **Rule 8, readers look twice.** A reader reads records first, then checks
-for any sign of a later epoch (a slot, or a ballot block). If there is one,
+for any sign of a later epoch (a ballot block, then the slot). If there is one,
 it applies nothing until the slot appears and then applies only up to the
 cutoff. A record beyond a cutoff can only reach the disk after the ballot
 that fixes the cutoff began, so a reader that saw the record also sees the
@@ -105,6 +106,24 @@ A wrote its batch, and only afterwards read the ballot blocks (rule 6).
 Either A's read came before B's ballot block was written, in which case A's
 batch was on disk before B's scan and is inside the cutoff; or A's read saw
 the ballot and A did not acknowledge. No clock appears in this argument.
+
+### Why the slot is read last
+
+The check in rules 6 and 8 is several block reads, and a node can stall
+between any two of them. A ballot block does not stay put: a node that
+withdraws a ballot wipes its block. It can only do that for the epoch
+after next once the next epoch's slot is written. So a ballot that fixed
+a cutoff shows either in its block, when that is read, or in the slot, if
+the slot is read afterwards.
+
+The code first read the slot and then the blocks. A node stalled after
+the slot read could miss both: the epoch was decided, then two ballots
+for the following epoch were withdrawn and every block was empty again.
+An owner in that position acknowledged a record the new epoch had cut
+off, and a reader applied one. It needs three nodes, a process restart
+and five exact interleavings; 6,000 random schedules and eight lab runs
+never produced it. It was found while writing the block-level model in
+[tla/](tla/README.md), and is now `TestStalledBetweenTheReadsOfTheCheck`.
 
 ### What the lease is for
 

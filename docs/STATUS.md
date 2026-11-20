@@ -23,7 +23,7 @@ show. For results on real machines see [LAB-RUNS.md](LAB-RUNS.md) and
 | Log reuse (`pkg/trim`, `pkg/node`, `duet retire`) | Implemented; tested in simulation with mutation tests and as processes over seven laps of a small log |
 | Epoch table reuse | Not planned; one slot per ownership change, sized at format time |
 | SCSI-3 reservation backend | Not started |
-| TLA+ model | Not started |
+| TLA+ model (`docs/tla`) | Written for ownership, confirmation and readers; **not yet run through the model checker**. Writing it exposed a fault in the order of the owner's and reader's check, since fixed |
 | TLS, authentication, backup and restore, defragment, member add and remove | Not started |
 | Google Cloud lab (`deploy/lab-gcp`) | Run eight times; results, including the comparison with three-member etcd, in [docs/LAB-RUNS.md](LAB-RUNS.md) |
 | Anything on vSAN | Not started; needs a lab |
@@ -59,6 +59,11 @@ What that does and does not show:
 - The simulated disk is ideal: linearizable, atomic block writes, durable on
   return. Whether a vSAN multi-writer disk behaves that way is unverified
   and is the first thing to test on real hardware.
+- A fault that could lose an acknowledged write survived all of the above
+  and was found by reasoning, not by a test (see "Why the slot is read
+  last" in DESIGN.md). The random schedules explore pauses and crashes
+  widely but did not reach a five-step interleaving across three nodes.
+  There may be others like it.
 - Passing tests are evidence, not proof. A TLA+ model and independent
   testing are planned before any production claim.
 

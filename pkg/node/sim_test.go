@@ -29,6 +29,9 @@ type world struct {
 	lay   disk.Layout
 	depth int
 	hook  func(node int, op string, off int64)
+	// nested lets the hook fire for operations made while another node is
+	// held inside the hook, for tests that hold several nodes mid-operation.
+	nested bool
 
 	history map[uint64]string // first payload any node applied at each index
 	acked   map[uint64]string // payloads acknowledged to a client
@@ -55,7 +58,7 @@ func (d *hookDev) pre(op string, off int64) error {
 	if d.dead {
 		return errDead
 	}
-	if d.w.hook != nil && d.w.depth == 0 {
+	if d.w.hook != nil && (d.w.depth == 0 || d.w.nested) {
 		d.w.depth++
 		d.w.hook(d.node, op, off)
 		d.w.depth--
