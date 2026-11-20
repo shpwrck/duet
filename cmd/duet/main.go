@@ -40,6 +40,8 @@ func main() {
 		err = cmdEtcdLoad(os.Args[2:])
 	case "etcdverify":
 		err = cmdEtcdVerify(os.Args[2:])
+	case "etcdbench":
+		err = cmdEtcdBench(os.Args[2:])
 	default:
 		usage()
 	}

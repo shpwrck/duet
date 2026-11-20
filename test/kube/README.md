@@ -124,3 +124,31 @@ the two.
 
 Not exercised: real kubelets or workloads, more than 6,000 pods, or any
 of this on separate machines.
+
+## Reads, lists and watches
+
+`duet etcdbench` loads objects and then measures the calls a
+kube-apiserver makes most. It talks to any etcd v3 endpoint, so the same
+command measures both systems.
+
+    duet etcdbench -endpoints 127.0.0.1:23790,127.0.0.1:23791 -keys 20000 -duration 10s
+
+One machine, 20,000 objects of 4 KiB, duet with two nodes on one disk image
+and etcd v3.7.4 with three members. All members share one local disk here,
+which costs etcd three synchronous writes to it per write against duet's
+one, so the write rows flatter duet. The read rows do not depend on that.
+
+| Call | duet, 2 nodes | etcd, 3 members |
+|---|---|---|
+| Read one object, must be current, 32 clients | 8,018/s, p99 11.5 ms | 8,065/s, p99 11.7 ms |
+| Read one object, may be stale, 32 clients | 10,872/s, p99 9.7 ms | 12,665/s, p99 8.9 ms |
+| List all 20,000 in pages of 500, 4 clients | p50 0.80 s, p99 0.92 s | p50 0.81 s, p99 0.94 s |
+| 90% reads, 10% writes, 32 clients | 6,551/s, p99 13.7 ms | 4,064/s, p99 21.1 ms |
+| Writes with 50 watchers on the prefix, 8 clients | 753/s, p99 29.2 ms | 561/s, p99 39.5 ms |
+| Write sent to watch event received, 50 watchers | p50 10.1 ms, p99 28.8 ms | p50 14.3 ms, p99 42.1 ms |
+
+Reads and lists are the same within noise, which is expected: both serve
+them from the same etcd storage code. A read that must be current costs
+duet one confirmation that it still owns the log and costs etcd one round
+to a majority. Half of duet's clients reach the standby first and are
+forwarded, and that shows in the stale-read row.
