@@ -25,6 +25,8 @@ as part of VKS. Each row is a question to answer or a request to make.
 | VKS, VM Service, Cluster API | No way found to attach a shared disk to control plane VMs | Declare a shared disk on the control plane and keep it across rolling node replacement |
 | VKS | Datastore is stacked etcd | An external-datastore option for control planes |
 | vSphere | Shared-disk VMs restrict snapshots, storage vMotion and similar | Confirm which restrictions apply and whether VKS lifecycle operations depend on them |
+| vSAN | A multi-writer disk accepts a write from any attached VM, however stale | Let a disk reject writes from a writer whose epoch is out of date, as the journals behind EKS, MemoryDB and Aurora do. duet could then reuse log space without asking vCenter whether a lost node is really gone |
+| VKS, Cluster API | duet needs to know when a control plane VM is gone for good | A hook on machine deletion that runs once vCenter has removed the VM |
 
 ## Not a gap
 

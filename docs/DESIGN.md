@@ -201,14 +201,49 @@ the reason found in lab run 3: a suspended node's clock stops.
   whose owner has not retired) + log size`. If it cannot advance, writes
   fail with "log full", as today.
 
-**The consequence that needs a decision.** If a deposed owner never comes
-back (host destroyed), nothing on the disk can prove it will not write
-again, and the log cannot wrap past its gap. Someone or something has to
-declare the node dead: an operator command, or a fencing mechanism. This
-is the one place where the "no fencing" position costs something, and it
-is where SCSI-3 reservations or a VCF-side power-state check would earn
-their place. Until the node is declared dead the cluster keeps running on
-the remaining log space; it does not lose data.
+**A deposed owner that never comes back.** If its host is destroyed,
+nothing on the disk can prove it will not write again, and the log cannot
+wrap past its gap. Something outside the disk has to say the node is
+gone. The decision:
+
+1. **The node's own mark covers every case where it runs again.** vSphere
+   HA restarting the VM, a reboot, a VKS node replaced in place, a
+   suspended VM resuming: each ends with the node writing its lease block
+   under a new incarnation or with the deposed mark.
+2. **For a node that never runs again, vCenter is the authority, and it
+   is asked off the failover path.** A small controller confirms through
+   vCenter that the VM is powered off or deleted and then writes the
+   retire mark for that node (`duet retire`). In VKS the natural hook is
+   Cluster API machine deletion, which completes only once vCenter has
+   removed the VM. This is the check Pacemaker's `fence_vmware_rest`
+   makes, with one difference that matters: **takeover never waits for
+   it.** Only reclaiming log space does. In a two-site failure vCenter may
+   be down or on the wrong side; the surviving node still takes over in
+   seconds and keeps writing into the space the log has left.
+3. **The log is sized for that wait.** Free space must cover the longest
+   time vCenter may be unreachable. At 1,000 writes a second of 1 KiB
+   that is about 86 GiB a day.
+
+Why this and not the alternatives:
+
+- **What the cloud designs do** is fence at the storage layer: the
+  journal behind EKS, MemoryDB and Aurora refuses an append from a writer
+  with a stale epoch. That is the right answer and vSAN does not offer
+  it: a multi-writer disk accepts any attached VM's write, and SCSI-3
+  reservations on vSAN are supported for Windows failover clustering
+  only. This is recorded in [VCF-GAPS.md](VCF-GAPS.md); if the platform
+  gains it, step 2 disappears.
+- **Spanner's answer is bounded clocks.** Lab run 3 showed a VM's clock
+  cannot carry that weight: it stops while the VM is suspended.
+- **vSAN already fences the common two-site case.** A site cut off from
+  both the other site and the witness loses access to its objects and its
+  VMs are powered off, so a deposed owner there cannot write, and when it
+  returns it does so as a restarted VM, which is case 1.
+- **Suspending a VM with a multi-writer disk is unsupported** in vSphere,
+  which narrows the long-pause hazard on VCF. It does not remove it (a
+  host can stall), so the rule stays.
+- **It scales with partitions.** Retirement is per node, not per log: one
+  vCenter answer retires that node in every partition's log.
 
 **Epoch table.** It stays finite. Reusing slots has the same late-writer
 hazard for ballot participants and is deferred. One slot is used per
