@@ -57,7 +57,7 @@ safety argument.
 | Log trimming, epoch table reuse | Not started; the log fills up and stops |
 | SCSI-3 reservation backend | Not started |
 | TLA+ model | Not started |
-| Google Cloud lab (`deploy/lab-gcp`) | Run; results in [docs/LAB-RUNS.md](docs/LAB-RUNS.md). Tests the log, not yet the etcd API |
+| Google Cloud lab (`deploy/lab-gcp`) | Run six times; results, including the comparison with three-member etcd, in [docs/LAB-RUNS.md](docs/LAB-RUNS.md) |
 | Anything on vSAN | Not started; needs a lab |
 
 ## Tests
