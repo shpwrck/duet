@@ -153,6 +153,16 @@ wait_ssh "$CLIENT" "$CZONE"
 for i in 0 1; do install_duet "${NAME[$i]}" "${ZONE[$i]}"; done
 install_duet "$CLIENT" "$CZONE"
 
+# How fast is the shared disk from each node today? Everything below
+# depends on it, and it has differed two-fold between nodes and runs.
+probe='[]'
+for i in 0 1; do
+  p="$(node "$i" "sudo duet diskprobe -device $DEV -offset $((1073741824 + i * 1048576))" 2>/dev/null | tail -n1)"
+  jq -e . >/dev/null 2>&1 <<<"$p" || p='{}'
+  probe="$(jq --arg n "$i" --arg z "${ZONE[$i]}" --argjson p "$p" '. + [{node: $n, zone: $z} + $p]' <<<"$probe")"
+done
+echo "$probe"
+
 node 0 "sudo duet format -device $DEV -nodes 2 -ttl $TTL -epoch-slots 1024 -max-batch 1048576"
 start_node 0
 start_node 1
@@ -221,14 +231,18 @@ api_scenario() { # api_scenario NAME SECONDS WORKERS FAULT_FUNCTION
   sleep 15
   "$fault"
   sleep "$((secs + 5))"
-  local summary verify ok=true
+  local summary verify ok=true counters='{}'
   summary="$(client "cat /tmp/load-$tag.json" 2>/dev/null || true)"
   jq -e . >/dev/null 2>&1 <<<"$summary" || summary='{}'
+  if [ "$BACKEND" = duet ]; then # write-path counters of whoever leads now (reset when a node restarts)
+    counters="$(client "curl -s --max-time 2 http://${IP[$(leader)]}:7000/status" 2>/dev/null | jq -c '{batches, records, append_ms, apply_ms}' 2>/dev/null)" || counters='{}'
+    jq -e . >/dev/null 2>&1 <<<"$counters" || counters='{}'
+  fi
   verify="$(client "duet etcdverify -endpoints $(api_endpoints) -acks /tmp/acks-$tag.txt -wait 180s 2>/dev/null")" || ok=false
   echo "$summary"
   echo "$verify"
-  api_results="$(jq --arg b "$BACKEND" --arg n "$name" --argjson s "$summary" --arg v "$verify" --argjson ok "$ok" --arg o "$first" \
-    '. + [{backend: $b, scenario: $n, leader_at_start: $o, verified: $ok, verify: $v, load: $s}]' <<<"$api_results")"
+  api_results="$(jq --arg b "$BACKEND" --arg n "$name" --argjson s "$summary" --arg v "$verify" --argjson ok "$ok" --arg o "$first" --argjson c "$counters" \
+    '. + [{backend: $b, scenario: $n, leader_at_start: $o, verified: $ok, verify: $v, load: $s, counters: $c}]' <<<"$api_results")"
 }
 
 api_kill() { # leader process killed, restarted ten seconds later
@@ -271,13 +285,15 @@ for BACKEND in duet etcd; do
   for i in $(members); do node "$i" "sudo systemctl stop $(unit)" || true; done
 done
 
-jq --arg ttl "$TTL" --argjson api "$api_results" '{lease: $ttl, storage: "GCP Hyperdisk Balanced High Availability, multi-writer, two zones", scenarios: ., api: $api}' \
+jq --arg ttl "$TTL" --argjson api "$api_results" --argjson probe "$probe" '{lease: $ttl, disk_probe: $probe, storage: "GCP Hyperdisk Balanced High Availability, multi-writer, two zones", scenarios: ., api: $api}' \
   <<<"$results" > results.json
 
 {
   echo "## duet lab on Google Cloud"
   echo
   echo "Lease $TTL. Two nodes in two zones on one regional multi-writer disk."
+  echo
+  echo "Shared disk, one 4 KiB synchronous write: $(jq -r '[.disk_probe[] | "node \(.node) (\(.zone)) p50 \(.write_sync_ms_p50 // "?") ms, p99 \(.write_sync_ms_p99 // "?") ms"] | join("; ")' results.json)."
   echo
   echo "| Scenario | Owner at start | Verified | Acknowledged | Writes/s | p50 ms | p99 ms | Longest gap ms |"
   echo "| --- | --- | --- | --- | --- | --- | --- | --- |"
