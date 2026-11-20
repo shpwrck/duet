@@ -152,3 +152,31 @@ them from the same etcd storage code. A read that must be current costs
 duet one confirmation that it still owns the log and costs etcd one round
 to a majority. Half of duet's clients reach the standby first and are
 forwarded, and that shows in the stale-read row.
+
+## A larger state
+
+The same machine with 100,000 objects of 4 KiB and then two more load
+phases, so the etcd state file grows from 240 MiB to 740 MiB. A checkpoint
+is taken every 40,000 records.
+
+| Measurement | Result |
+|---|---|
+| Checkpoint of 240 MiB | 1.4 s |
+| Checkpoint of 490 MiB | 2.6 s |
+| Checkpoint of 690 MiB | 3.0 s |
+| Longest stretch with no acknowledged write while checkpoints are taken, 8 clients | 57 ms |
+| Standby restarted with an empty state directory, until it has the 740 MiB state back from the shared disk | 4.5 s |
+| Owner killed under load with that state, longest stretch with no acknowledged write | 2.4 s |
+| Acknowledged writes lost | 0 of 58,716 |
+
+Checkpoint time grows with the state, at roughly 200 to 250 MiB a second
+on this disk, and it does not stop writes. The time to replace a killed
+owner is the same as with an empty store, because the standby already has
+the state applied and only the lease has to run out. A standby that lost
+everything is rebuilt from the shared disk with no copy from the other
+node.
+
+This is still a small state by the measure of a large cluster (etcd's
+default limit is 2 GiB and large clusters raise it to 8 GiB). At 8 GiB a
+checkpoint at this disk speed would take 30 to 40 s and each node needs
+two slots of that size on the shared disk. That has not been run.

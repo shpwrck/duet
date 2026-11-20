@@ -437,6 +437,7 @@ func cmdRun(args []string) error {
 	if err := s.n.Seek(cursor); err != nil {
 		return err
 	}
+	s.cursorOff.Store(s.n.Cursor().Offset)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
