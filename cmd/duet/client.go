@@ -37,9 +37,14 @@ func cmdLoad(args []string) error {
 	workers := fs.Int("workers", 8, "concurrent writers")
 	size := fs.Int("size", 256, "payload bytes")
 	acksPath := fs.String("acks", "acks.txt", "file to record acknowledged writes in")
+	timeout := fs.Duration("timeout", 2*time.Second, "per-request timeout; bounds how long a frozen owner can hold a client")
 	fs.Parse(args)
 	eps := strings.Split(*endpoints, ",")
-	client := &http.Client{Timeout: 2 * time.Second}
+	// One kept-alive connection per worker. The default transport keeps two
+	// per host, which makes many workers reconnect constantly and measures
+	// the client instead of the store.
+	client := &http.Client{Timeout: *timeout, Transport: &http.Transport{
+		MaxIdleConns: 2 * *workers, MaxIdleConnsPerHost: *workers, IdleConnTimeout: time.Minute}}
 
 	out, err := os.Create(*acksPath)
 	if err != nil {

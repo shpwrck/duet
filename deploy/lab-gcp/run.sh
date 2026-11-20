@@ -102,12 +102,21 @@ fault_handover() { # planned stop: the owner releases the lease
   sleep 5
   start_node "$o"
 }
-fault_vm_stop() { # the owner's whole VM goes away, as when a host is lost
+fault_vm_suspend() { # the owner's whole VM is suspended by the hypervisor, then resumed
   local o
   o="$(owner)"
-  gcloud compute instances stop "${NAME[$o]}" --zone "${ZONE[$o]}" --project "$PROJECT" --quiet
+  if ! gcloud compute instances suspend "${NAME[$o]}" --zone "${ZONE[$o]}" --project "$PROJECT" --quiet; then
+    echo "suspend not available for this instance; scenario ran with no fault" >&2
+    return 0
+  fi
+  sleep 25
+  gcloud compute instances resume "${NAME[$o]}" --zone "${ZONE[$o]}" --project "$PROJECT" --quiet
+}
+fault_vm_reset() { # the owner's VM is hard reset with no shutdown, as when a host is lost
+  local o
+  o="$(owner)"
+  gcloud compute instances reset "${NAME[$o]}" --zone "${ZONE[$o]}" --project "$PROJECT" --quiet
   sleep 30
-  gcloud compute instances start "${NAME[$o]}" --zone "${ZONE[$o]}" --project "$PROJECT" --quiet
   wait_ssh "${NAME[$o]}" "${ZONE[$o]}"
   start_node "$o"
 }
@@ -127,7 +136,8 @@ scenario throughput 60 128 fault_none
 scenario handover 60 8 fault_handover
 scenario freeze 90 8 fault_freeze
 scenario kill 90 8 fault_kill
-scenario vm_stop 180 8 fault_vm_stop
+scenario vm_suspend 120 8 fault_vm_suspend
+scenario vm_reset 180 8 fault_vm_reset
 
 jq --arg ttl "$TTL" '{lease: $ttl, storage: "GCP Hyperdisk Balanced High Availability, multi-writer, two zones", scenarios: .}' \
   <<<"$results" > results.json

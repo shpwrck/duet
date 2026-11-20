@@ -27,10 +27,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 75
     env:
-      # Identifiers, not secrets. Repository variables override them if set.
-      TF_VAR_project: ${{ vars.GCP_PROJECT || 'duet-515304' }}
-      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT || 'duet-lab@duet-515304.iam.gserviceaccount.com' }}
-      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER || 'projects/846285550787/locations/global/workloadIdentityPools/github/providers/duet-repo' }}
+      # Set these three as repository variables; deploy/lab-gcp/setup.sh prints them.
+      TF_VAR_project: ${{ vars.GCP_PROJECT }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
       TF_IN_AUTOMATION: "true"
       DUET_TTL: ${{ inputs.ttl }}
     defaults:
