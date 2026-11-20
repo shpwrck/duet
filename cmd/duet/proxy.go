@@ -6,12 +6,14 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
-	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
 const (
@@ -147,15 +149,30 @@ type forwarder struct {
 	peers []string
 	self  int
 	owner func() int
+	wait  time.Duration // how long a call waits for an owner to be known
 
 	mu    sync.Mutex
 	conns map[int]*grpc.ClientConn
 }
 
-func (f *forwarder) conn() (*grpc.ClientConn, error) {
+// errNoOwner is plain Unavailable on purpose. etcd's own "no leader" error
+// makes the etcd client give up on a watch for good; Unavailable makes it
+// retry, which is right while an owner is being chosen.
+var errNoOwner = grpcstatus.Error(codes.Unavailable, "duet: no owner to forward to yet")
+
+func (f *forwarder) conn(ctx context.Context) (*grpc.ClientConn, error) {
+	// Wait a little for an owner to be known instead of failing calls
+	// that arrive during a takeover or just after this node started.
 	o := f.owner()
-	if o < 0 || o >= len(f.peers) || o == f.self {
-		return nil, rpctypes.ErrGRPCNoLeader
+	for deadline := time.Now().Add(f.wait); o < 0 || o >= len(f.peers) || o == f.self; o = f.owner() {
+		if time.Now().After(deadline) {
+			return nil, errNoOwner
+		}
+		select {
+		case <-ctx.Done():
+			return nil, grpcstatus.FromContextError(ctx.Err()).Err()
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -165,7 +182,7 @@ func (f *forwarder) conn() (*grpc.ClientConn, error) {
 	c, err := grpc.NewClient(f.peers[o], grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodecV2(rawCodec{})))
 	if err != nil {
-		return nil, rpctypes.ErrGRPCNoLeader
+		return nil, errNoOwner
 	}
 	f.conns[o] = c
 	return c, nil
@@ -174,15 +191,15 @@ func (f *forwarder) conn() (*grpc.ClientConn, error) {
 func (f *forwarder) handle(_ any, ss grpc.ServerStream) error {
 	method, ok := grpc.MethodFromServerStream(ss)
 	if !ok {
-		return rpctypes.ErrGRPCNoLeader
+		return errNoOwner
 	}
 	md, _ := metadata.FromIncomingContext(ss.Context())
 	if len(md.Get(forwardedKey)) > 0 {
 		// The sender thought this node was the owner. Refusing stops two
 		// nodes with different views from forwarding to each other.
-		return rpctypes.ErrGRPCNoLeader
+		return errNoOwner
 	}
-	conn, err := f.conn()
+	conn, err := f.conn(ss.Context())
 	if err != nil {
 		return err
 	}

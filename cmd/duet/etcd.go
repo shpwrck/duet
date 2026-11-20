@@ -118,7 +118,7 @@ func (s *server) startEtcd(addr string, peers []string) error {
 		return err
 	}
 	s.front = newFront(lis)
-	s.fwd = &forwarder{peers: peers, self: s.id, owner: s.ownerID, conns: map[int]*grpc.ClientConn{}}
+	s.fwd = &forwarder{peers: peers, self: s.id, owner: s.ownerID, wait: 2 * s.l.TTL, conns: map[int]*grpc.ClientConn{}}
 
 	real := grpc.NewServer()
 	b, member := etcdBackend{s}, uint64(s.id+1)
