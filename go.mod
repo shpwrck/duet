@@ -4,9 +4,11 @@ go 1.26.0
 
 require (
 	go.etcd.io/etcd/api/v3 v3.7.4
+	go.etcd.io/etcd/client/v3 v3.7.4
 	go.etcd.io/etcd/pkg/v3 v3.7.4
 	go.etcd.io/etcd/server/v3 v3.7.4
 	go.uber.org/zap v1.27.1
+	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.11
 )
 
@@ -28,7 +30,6 @@ require (
 	github.com/prometheus/procfs v0.16.1 // indirect
 	go.etcd.io/bbolt v1.5.0 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.7.4 // indirect
-	go.etcd.io/etcd/client/v3 v3.7.4 // indirect
 	go.etcd.io/raft/v3 v3.7.0 // indirect
 	go.opentelemetry.io/otel v1.45.0 // indirect
 	go.opentelemetry.io/otel/sdk/metric v1.45.0 // indirect
@@ -41,6 +42,5 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260803160001-6ac0973c030d // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
-	google.golang.org/grpc v1.83.2 // indirect
 	k8s.io/utils v0.0.0-20260108192941-914a6e750570 // indirect
 )
