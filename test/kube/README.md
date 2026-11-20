@@ -180,3 +180,30 @@ This is still a small state by the measure of a large cluster (etcd's
 default limit is 2 GiB and large clusters raise it to 8 GiB). At 8 GiB a
 checkpoint at this disk speed would take 30 to 40 s and each node needs
 two slots of that size on the shared disk. That has not been run.
+
+## Soak with random faults
+
+`test/soak.sh` runs two nodes on a 1.3 GiB disk image, small enough that
+the log wraps. Each round writes for 20 s, injects one fault chosen at
+random (kill the owner, stop the owner, kill the standby, kill the standby
+and delete its state, freeze the owner for 6 s), verifies every
+acknowledged write, then empties and compacts the store.
+
+    BIN=/path/to/binaries test/soak.sh 19
+
+| 19 rounds, 9 minutes | Result |
+|---|---|
+| Acknowledged writes | 583,385 |
+| Acknowledged writes missing | 0 |
+| Times round the log | 7.5 |
+| Longest stretch with no acknowledged write, owner killed (5 times) | 2.2 to 2.6 s |
+| Same, owner frozen (3 times) | 2.2 to 2.7 s |
+| Same, owner stopped on purpose (8 times) | 0.11 to 0.31 s |
+| Same, standby killed, with or without its state (3 times) | 0.04 to 0.17 s |
+
+The first attempt at this run is where the size limit came from: the
+store was never emptied, the state outgrew its checkpoint slot, the log
+filled and the cluster stopped for good. See "Checkpoints" in
+[DESIGN.md](../../docs/DESIGN.md).
+
+Nine minutes is a short soak. It has not been run for hours or days.
