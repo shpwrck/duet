@@ -75,8 +75,9 @@ tail to find the cutoff only after its Paxos block is on disk and the
 re-read in rule 4 passed. From that point the old owner can acknowledge
 nothing new.
 
-**Rule 6, check after write.** The owner acknowledges a batch only if the
-lease is still valid after the batch was flushed.
+**Rule 6, confirm after write.** After a batch is flushed, the owner reads
+the other nodes' ballot blocks and the next epoch slot. It acknowledges the
+batch only if there is no sign of a later epoch. This read uses no clock.
 
 **Rule 7, gap between epochs.** A new epoch starts on the block boundary
 one maximum batch past the cutoff. A writer has at most one batch in flight, and it lands within
@@ -96,14 +97,26 @@ continues after them. Other nodes may have applied them.
 
 ### Why an acknowledged write survives
 
-Take an owner A and a challenger B that completes a ballot. B's re-read in
-rule 4 saw A's lease block unchanged, so every clean renewal of A landed
-before B first observed that value at time `s`. A's lease is therefore
-valid no later than `s + TTL * (1 - drift)` in A's time, which is before B
-started its ballot at `s + TTL * (1 + drift)` in B's time, provided the two
-clocks differ in rate by no more than `drift`. A write A acknowledged was on
-disk before A's check passed, hence before B's ballot, hence before B's
-cutoff scan. B's cutoff includes it.
+Take an owner A and a challenger B that completes a ballot. B wrote its
+ballot block, and only afterwards scanned the log for the cutoff (rule 5).
+A wrote its batch, and only afterwards read the ballot blocks (rule 6).
+Either A's read came before B's ballot block was written, in which case A's
+batch was on disk before B's scan and is inside the cutoff; or A's read saw
+the ballot and A did not acknowledge. No clock appears in this argument.
+
+### What the lease is for
+
+Leases and clocks decide when a challenger may start a ballot (rule 3) and
+let an owner stop early without a disk read. They affect how often
+ownership changes needlessly. They are not what makes an acknowledgement
+safe.
+
+This was not the original design. Rule 6 first checked the lease by the
+local clock. Lab run 3 on Google Cloud suspended the owner's VM and resumed
+it: the guest's clock had not moved, so by its own clock the lease was
+still good, and it accepted a write after the other node had taken over.
+The simulation had only modelled pauses during which the paused node's
+clock kept running. It now models clocks that stop.
 
 ### Assumptions
 
@@ -112,7 +125,7 @@ cutoff scan. B's cutoff includes it.
 | A1 | Reads and writes on the shared disk are linearizable across nodes | Unverified on vSAN multi-writer disks |
 | A2 | A 4096-byte write is atomic, or a torn write fails its CRC | Standard for block devices; unverified here |
 | A3 | A flush returning means the data survives what vSAN is configured to tolerate | Unverified for multi-writer disks |
-| A4 | Two nodes' clocks differ in rate by less than `drift` over one lease period | VM stuns are pauses, which the protocol tolerates; rate drift on VMs to be measured |
+| A4 | Two nodes' clocks differ in rate by less than `drift` over one lease period | Needed only to avoid needless ownership changes. Safety does not depend on it, which matters because a suspended VM's clock stops. |
 | A5 | A writer has at most one batch in flight | True of the code |
 | A6 | One process per node id at a time | Operational; not enforced |
 | A7 | A crashed process's in-flight write is at most one batch | True of the code; kernel behaviour after process death to be checked |

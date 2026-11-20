@@ -28,9 +28,10 @@ and nothing has run on vSAN. See
   partition between nodes cannot create two owners.
 - **Everyone else tails.** Other nodes read the log as it grows and stay
   warm, so takeover replays only the unread tail.
-- **A deposed writer is harmless.** It acknowledges a write only if its
-  lease was still valid after the data reached the disk. A late write lands
-  in a gap that no reader ever looks at.
+- **A deposed writer is harmless.** After its data reaches the disk it reads
+  the disk again, and acknowledges only if no other node has started to take
+  over. That check uses no clock. A late write lands in a gap that no
+  reader ever looks at.
 
 [docs/DESIGN.md](docs/DESIGN.md) has the protocol, its assumptions and the
 safety argument.

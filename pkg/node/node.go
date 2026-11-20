@@ -246,9 +246,11 @@ func (n *Node) Append(batch [][]byte) (uint64, error) {
 		n.w = nil
 		return 0, err
 	}
-	// Check after write: acknowledge only if the lease was still valid once
-	// the data was already on disk.
-	if !n.m.Valid() {
+	// Confirm after write: acknowledge only if, with the data already on
+	// disk, there is still no sign of a newer epoch. This check reads the
+	// disk and does not trust the clock. The lease check stays as a second
+	// line of defence.
+	if err := n.m.Confirm(); err != nil || !n.m.Valid() {
 		n.w = nil
 		return 0, ErrLeaseLost
 	}

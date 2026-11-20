@@ -118,6 +118,44 @@ func TestPausedOwnerWriteLandsAfterTakeover(t *testing.T) {
 	}
 }
 
+// The same pause, but the owner's own clock stops while it is paused, as a
+// guest clock does when a hypervisor suspends the VM. By its own clock the
+// lease never expired. Found on Google Cloud in lab run 3: a suspended and
+// resumed owner acknowledged a write after another node had taken over.
+// Acknowledgement must not depend on the local clock.
+func TestSuspendedOwnerWhoseClockStopped(t *testing.T) {
+	w := newWorld(t, 3)
+	a, b := w.start(0, 1), w.start(1, 1)
+	mustOK(t, a.n.Campaign())
+	mustOK(t, w.append(a, "a1", "a2"))
+	mustErr(t, b.n.Campaign(), lease.ErrNotExpired)
+
+	fired := false
+	w.hook = func(node int, op string, off int64) {
+		if fired || node != 0 || op != "write" || off < w.lay.LogStart() {
+			return
+		}
+		fired = true
+		w.now += 2 * simTTL
+		*a.lag += 2 * simTTL // A's clock saw none of it
+		mustOK(t, b.n.Campaign())
+		mustOK(t, w.append(b, "b1"))
+	}
+	if err := w.append(a, "stale"); err == nil {
+		t.Fatal("a suspended owner acknowledged a write after losing ownership")
+	}
+	w.hook = nil
+	mustOK(t, w.append(b, "b2"))
+	got := w.verify(2)
+	if len(got) != 4 || got[2] != "b1" || got[3] != "b2" {
+		t.Fatalf("replay = %v", got)
+	}
+	mustOK(t, a.n.Tail())
+	if len(a.applied) != 4 {
+		t.Fatalf("old owner applied %v", a.applied)
+	}
+}
+
 // Owner renewal and challenger ballot at the same moment: whichever way the
 // block operations interleave, they must not both proceed.
 func TestRenewRacesBallot(t *testing.T) {
@@ -481,7 +519,11 @@ func runRandom(t *testing.T, seed int64, steps int) {
 		// This operation is slow, or the VM is stunned in the middle of it,
 		// and meanwhile other nodes get to act, possibly several times.
 		if rng.Intn(2) == 0 {
-			w.now += time.Duration(rng.Int63n(int64(simTTL * 3 / 2)))
+			dt := time.Duration(rng.Int63n(int64(simTTL * 3 / 2)))
+			w.now += dt
+			if node < members && rng.Intn(3) == 0 {
+				*nodes[node].lag += dt // a VM suspend: this node's clock stood still
+			}
 		}
 		for k := rng.Intn(4); k > 0; k-- {
 			j := rng.Intn(members)

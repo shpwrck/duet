@@ -77,6 +77,10 @@ jobs:
       - name: Run scenarios
         run: ./run.sh
 
+      - name: Node logs
+        if: failure()
+        run: tail -n 60 node-*.log || true
+
       - name: Summary
         if: always()
         run: test -f summary.md && cat summary.md >> "$GITHUB_STEP_SUMMARY" || echo "no summary produced" >> "$GITHUB_STEP_SUMMARY"
@@ -88,6 +92,7 @@ jobs:
           path: |
             deploy/lab-gcp/results.json
             deploy/lab-gcp/summary.md
+            deploy/lab-gcp/node-*.log
           if-no-files-found: ignore
 
       - name: Tear down

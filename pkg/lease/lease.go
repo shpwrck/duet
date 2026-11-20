@@ -316,13 +316,23 @@ func (m *Manager) Renew() error {
 	}
 	// Write, then read: a challenger does the same in the other order of
 	// blocks, so one of us is guaranteed to see the other.
-	unclean := false
+	if err := m.fence(); err != nil {
+		return err
+	}
+	m.renewStart, m.haveRenew = start, true
+	return nil
+}
+
+// fence reads the disk for any sign that a later epoch exists or is being
+// decided. It is the read half of the owner's write-then-read handshake.
+func (m *Manager) fence() error {
 	if _, st, err := m.readSlot(m.owned.Epoch + 1); err != nil {
 		return err
 	} else if st != disk.BlockEmpty {
 		m.lost = true
 		return ErrLeaseLost
 	}
+	unclean := false
 	for j := 0; j < m.l.Nodes; j++ {
 		if j == m.cfg.Node {
 			continue
@@ -332,7 +342,7 @@ func (m *Manager) Renew() error {
 			return err
 		}
 		if st == disk.BlockCorrupt {
-			unclean = true
+			unclean = true // possibly a ballot block in mid-write
 			continue
 		}
 		if st == disk.BlockValid && pb.Instance > m.owned.Epoch && pb.MBal > 0 {
@@ -343,8 +353,27 @@ func (m *Manager) Renew() error {
 	if unclean {
 		return ErrUnclean
 	}
-	m.renewStart, m.haveRenew = start, true
 	return nil
+}
+
+// Confirm reports whether this node may acknowledge what it has just
+// written. It must be called after the write has been flushed.
+//
+// This is what makes acknowledgements safe, and it uses no clock. The owner
+// writes its records and then reads the ballot blocks; a challenger writes
+// its ballot block and then reads the log to find the cutoff. If the owner
+// sees no ballot, its records were on disk before the challenger's ballot
+// block was, so the challenger's cutoff includes them. If it sees one, it
+// does not acknowledge.
+//
+// A lease judged by the local clock is not enough for this. A VM that is
+// suspended by its hypervisor and resumed finds its clock where it left
+// it, so by that clock the lease never expired.
+func (m *Manager) Confirm() error {
+	if m.owned == nil || m.lost {
+		return ErrNotOwner
+	}
+	return m.fence()
 }
 
 // Release gives up ownership so another node can take over without waiting

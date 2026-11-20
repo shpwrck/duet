@@ -7,3 +7,4 @@ terraform.tfstate*
 /deploy/lab-gcp/results.json
 /deploy/lab-gcp/summary.md
 gha-creds-*.json
+/deploy/lab-gcp/node-*.log

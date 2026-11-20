@@ -61,6 +61,15 @@ owner() { # prints 0 or 1, the index of the current owner
   return 1
 }
 
+# Whatever happens, keep each node's own log; it is the only record of why a
+# node misbehaved once the VMs are gone.
+collect_logs() {
+  for i in 0 1; do
+    node "$i" "sudo journalctl -u duet-node --no-pager -o short-precise | tail -n 400" > "node-$i.log" 2>&1 || true
+  done
+}
+trap collect_logs EXIT
+
 results='[]'
 scenario() { # scenario NAME SECONDS WORKERS FAULT_FUNCTION
   local name=$1 secs=$2 workers=$3 fault=$4

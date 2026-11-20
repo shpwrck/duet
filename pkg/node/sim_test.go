@@ -38,9 +38,10 @@ type world struct {
 type simClock struct {
 	w    *world
 	rate float64
+	lag  *time.Duration // time this node did not see pass (a suspended VM)
 }
 
-func (c simClock) Now() time.Duration { return time.Duration(float64(c.w.now) * c.rate) }
+func (c simClock) Now() time.Duration { return time.Duration(float64(c.w.now-*c.lag) * c.rate) }
 
 type hookDev struct {
 	w    *world
@@ -85,6 +86,7 @@ func (d *hookDev) Size() int64 { return d.w.disk.Size() }
 type simNode struct {
 	id      int
 	rate    float64
+	lag     *time.Duration
 	dev     *hookDev
 	n       *Node
 	applied []string
@@ -105,10 +107,10 @@ func newWorld(t *testing.T, nodes int) *world {
 func (w *world) start(id int, rate float64) *simNode {
 	w.t.Helper()
 	w.nextInc++
-	s := &simNode{id: id, rate: rate, dev: &hookDev{w: w, node: id}}
+	s := &simNode{id: id, rate: rate, lag: new(time.Duration), dev: &hookDev{w: w, node: id}}
 	saved := w.hook
 	w.hook = nil // opening the superblock is not part of the protocol
-	n, err := New(s.dev, simClock{w, rate}, lease.Config{Node: id, Incarnation: w.nextInc, Drift: simDrift},
+	n, err := New(s.dev, simClock{w, rate, s.lag}, lease.Config{Node: id, Incarnation: w.nextInc, Drift: simDrift},
 		func(index uint64, payload []byte) {
 			if index != uint64(len(s.applied))+1 {
 				w.t.Fatalf("node %d applied index %d after %d records", id, index, len(s.applied))
