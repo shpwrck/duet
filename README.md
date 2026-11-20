@@ -16,7 +16,8 @@ the log is a shared disk.
 **Status: early.** The ownership protocol and the log are tested in
 simulation, as real processes on one machine, and on two Google Cloud VMs
 sharing a replicated disk. The stock etcd client works against it across an
-owner failure. kube-apiserver has not been run against it yet, restarts
+owner failure, and Kubernetes' storage layer passes most of its own test
+suite against it. kube-apiserver itself has not been run against it, restarts
 replay the whole log, and nothing has run on vSAN. See
 [what exists](#what-exists-today) before drawing conclusions.
 
@@ -50,7 +51,7 @@ safety argument.
 | `duet` process: direct I/O, real clock, renewal loop, group commit (`cmd/duet`) | Implemented, with a temporary HTTP interface for testing |
 | Process-level fault test (`test/proc`) | Implemented: owner frozen and killed under load |
 | State machine: etcd's own storage, transaction and lease code driven by the log (`pkg/sm`) | Implemented; rebuilt by full replay at every start |
-| etcd v3 gRPC API: KV, Watch, Lease, Maintenance Status (`pkg/api`, `duet run -etcd`) | Implemented for what kube-apiserver uses; tested with the etcd client, not yet with kube-apiserver. Only the owner serves |
+| etcd v3 gRPC API: KV, Watch, Lease, Maintenance Status (`pkg/api`, `duet run -etcd`) | Implemented for what kube-apiserver uses; passes the part of Kubernetes' own storage test suite listed in [test/kube](test/kube/README.md); kube-apiserver itself has not been run. Only the owner serves |
 | Checkpoints and log trimming | Not started |
 | SCSI-3 reservation backend | Not started |
 | TLA+ model | Not started |

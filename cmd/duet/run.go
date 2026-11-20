@@ -93,12 +93,13 @@ type server struct {
 	epoch uint64
 
 	// etcd mode only.
-	st       *sm.Store
-	etcdAddr string
-	etcdSrv  *grpc.Server // non-nil only while this node is the owner
-	barriers chan chan error
-	collect  bool        // true while the loop is inside Append
-	results  []sm.Result // results of the batch being appended
+	st            *sm.Store
+	etcdAddr      string
+	watchProgress time.Duration
+	etcdSrv       *grpc.Server // non-nil only while this node is the owner
+	barriers      chan chan error
+	collect       bool        // true while the loop is inside Append
+	results       []sm.Result // results of the batch being appended
 }
 
 func (s *server) apply(index uint64, payload []byte) {
@@ -301,6 +302,7 @@ func cmdRun(args []string) error {
 	campaign := fs.Bool("campaign", true, "stand for ownership; false makes a read-only follower")
 	etcdListen := fs.String("etcd", "", "address for the etcd v3 gRPC API; empty leaves it off and the log carries opaque payloads")
 	stateDir := fs.String("state-dir", "", "directory for the etcd state machine's files (rebuilt from the log at every start); default is the system temporary directory")
+	watchProgress := fs.Duration("watch-progress-interval", 10*time.Minute, "how often idle watchers that asked for progress notifications get one (etcd's --watch-progress-notify-interval; kubeadm sets 5s)")
 	startDelay := fs.Duration("start-delay", time.Second, "wait before first touching the disk, so a previous process's last write has landed")
 	fs.Parse(args)
 
@@ -322,7 +324,7 @@ func cmdRun(args []string) error {
 		}
 		defer s.st.Close()
 		s.barriers = make(chan chan error, 8192)
-		s.etcdAddr = *etcdListen
+		s.etcdAddr, s.watchProgress = *etcdListen, *watchProgress
 	}
 	s.n, err = node.New(dev, realClock{time.Now()},
 		lease.Config{Node: *id, Incarnation: uint64(time.Now().UnixNano()), Drift: *drift}, s.apply)

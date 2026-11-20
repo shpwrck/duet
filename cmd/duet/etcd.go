@@ -129,7 +129,9 @@ func (s *server) followOwnership(owner bool) {
 	b, member := etcdBackend{s}, uint64(s.id+1)
 	kv := api.NewKV(b, 1, member)
 	pb.RegisterKVServer(srv, kv)
-	pb.RegisterWatchServer(srv, api.NewWatch(b, 1, member))
+	watch := api.NewWatch(b, 1, member)
+	watch.Progress = s.watchProgress
+	pb.RegisterWatchServer(srv, watch)
 	pb.RegisterLeaseServer(srv, api.NewLease(kv))
 	pb.RegisterMaintenanceServer(srv, api.NewMaintenance(kv))
 	// Leases count down only on the owner. A new owner gives every lease
