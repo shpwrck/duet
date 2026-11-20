@@ -124,6 +124,29 @@ off, and a reader applied one. It needs three nodes, a process restart
 and five exact interleavings; 6,000 random schedules and eight lab runs
 never produced it. It was found while writing the block-level model in
 [tla/](tla/README.md), and is now `TestStalledBetweenTheReadsOfTheCheck`.
+The lab binaries up to run 9 had this fault.
+
+### A ballot goes by the table
+
+The same wiping of blocks had a second consequence. A node picks the
+epoch to stand for from the table and may stall before its ballot
+starts. If that epoch is decided meanwhile and the blocks are wiped by
+withdrawn ballots for the next one, the stalled node's ballot sees
+nothing, chooses itself, and, as the code was, carried on as owner even
+though the slot it was about to write already named another node. Two
+owners of one epoch. A ballot now reads the slot after its first survey
+and stops if the epoch is decided, and at the end goes by what the table
+holds, not by what it arrived at. Test:
+`TestStalledBeforeBallotForAnEpochAlreadyDecided`.
+
+Both faults have one root. Disk Paxos is proven on the assumption that
+a ballot block is never erased. duet erases them when a ballot is
+withdrawn, so that a stale ballot does not force a live owner out, and
+that makes the epoch table, not the blocks, the lasting record. Every
+place that reads blocks to learn whether something was decided must
+also read the table, afterwards. The places are: the owner's check,
+the reader's check, and the ballot. There are no others in the code
+today, by inspection; that claim has not been model-checked.
 
 ### What the lease is for
 

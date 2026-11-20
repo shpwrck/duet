@@ -227,3 +227,82 @@ func stalledBetweenReads(t *testing.T, who string, k int) {
 		t.Errorf("held at point %d of its check, the reader applied a record that epoch 2 had already cut off: %v", k, d.applied)
 	}
 }
+
+// A node works out which epoch to stand for by reading the table, and may
+// stall before it starts its ballot. By then that epoch can have been
+// decided, and every ballot block that would say so wiped again by
+// withdrawn ballots for the epoch after. Disk Paxos proper never wipes a
+// block; duet does (retreat), so the table has to be consulted as well.
+//
+// Without that, the stalled node ran a ballot for an epoch that already
+// had an owner, saw nothing, chose itself, found the slot already written,
+// left it alone and carried on as owner anyway: two owners of one epoch.
+func TestStalledBeforeBallotForAnEpochAlreadyDecided(t *testing.T) {
+	w := newWorld(t, 3)
+	lay := w.lay
+	read := func(off int64) func(string, int64) bool { return nth(1, "read", off) }
+	write := func(off int64) func(string, int64) bool { return nth(1, "write", off) }
+
+	a, b, c := w.start(0, 1), w.start(1, 1), w.start(2, 1)
+	mustOK(t, a.n.Campaign())
+	mustOK(t, w.append(a, "a1"))
+	for _, s := range []*simNode{b, c} {
+		if err := s.n.Campaign(); err == nil {
+			t.Fatal("took over a live owner")
+		}
+	}
+	w.now += 2 * simTTL
+	*a.lag += 2 * simTTL // A is suspended
+
+	st := newStage(w)
+	// C decides to stand for epoch 2 and stalls before its ballot starts.
+	gc := st.start(t, 2, c.n.Campaign, after(read(lay.LeaseOff(0)), read(lay.PaxosOff(2))))
+	// B takes epoch 2 and acknowledges a write in it.
+	w.hook = nil
+	mustOK(t, b.n.Campaign())
+	mustOK(t, w.append(b, "b1"))
+	st = restage(w, st)
+
+	// A wakes, sees it has been replaced, and in time decides B's lease
+	// has run out. It stalls as its ballot for epoch 3 starts.
+	*a.lag = 0
+	if err := a.n.Campaign(); err == nil {
+		t.Fatal("a took over on first sight")
+	}
+	w.now += 2 * simTTL
+	*b.lag += 2 * simTTL
+	*c.lag += 2 * simTTL
+	ga := st.start(t, 0, a.n.Campaign, after(read(lay.LeaseOff(1)), read(lay.PaxosOff(0))))
+	// B renews, dies, restarts and stands for epoch 3; held before it
+	// looks at A's block.
+	mustOK(t, b.n.Renew())
+	b.dev.dead = true
+	b2 := w.start(1, 1)
+	gb2 := st.start(t, 1, b2.n.Campaign, after(write(lay.PaxosOff(1)), read(lay.PaxosOff(0))))
+	// A writes a higher ballot and is held before re-reading B's lease.
+	ga.until(read(lay.LeaseOff(1)))
+	if err := gb2.finish(); err == nil {
+		t.Fatal("the restarted b won epoch 3; the schedule did not happen as intended")
+	}
+	if err := ga.finish(); err == nil {
+		t.Fatal("a won epoch 3; the schedule did not happen as intended")
+	}
+	// Epoch 2 is B's in the table and no ballot block says anything.
+
+	err := gc.finish()
+	w.hook, w.nested = nil, false
+	if err == nil && c.n.Epoch() == 2 {
+		t.Error("the stalled node made itself owner of epoch 2, which the table gives to another node")
+		if w.append(c, "c1") == nil {
+			t.Error("and acknowledged a write as its owner")
+		}
+	}
+	w.verify(0)
+}
+
+// restage re-installs the stage's hook after a stretch run without it.
+func restage(w *world, old *stage) *stage {
+	s := newStage(w)
+	s.actors = old.actors
+	return s
+}

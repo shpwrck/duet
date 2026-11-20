@@ -540,6 +540,23 @@ func (m *Manager) ballot(inst uint64, latest EpochRecord, have bool, watched lea
 		}
 	}
 
+	// Disk Paxos never erases a ballot block. duet does (retreat), so the
+	// blocks alone cannot be trusted to show that this instance was already
+	// decided: the node that decided it may since have stood for the next
+	// one and withdrawn. It could only do that after the slot was written,
+	// so the slot, read after the blocks, settles it. This matters when
+	// this node chose the instance from a view of the table that had gone
+	// stale by the time it got here.
+	if r, st, err := m.readSlot(inst); err != nil {
+		return EpochRecord{}, err
+	} else if st == disk.BlockValid {
+		m.retreat(own)
+		if inst > m.maxSeen {
+			m.maxSeen = inst
+		}
+		return r, nil
+	}
+
 	// Choose the value: one already accepted in this instance wins.
 	value := best.Inp
 	if best.Bal == 0 {
@@ -566,12 +583,15 @@ func (m *Manager) ballot(inst uint64, latest EpochRecord, have bool, watched lea
 
 	// Chosen. Record it in the epoch table; the write is idempotent because
 	// every node that completes this instance arrives at the same value.
-	if _, st, err := m.readSlot(inst); err != nil {
+	if r, st, err := m.readSlot(inst); err != nil {
 		return EpochRecord{}, err
-	} else if st != disk.BlockValid {
-		if err := m.writeSlot(value); err != nil {
-			return EpochRecord{}, err
-		}
+	} else if st == disk.BlockValid {
+		// Already recorded. If a ballot block was erased between our two
+		// surveys, what is recorded need not be what we arrived at, and
+		// the table is what every reader follows.
+		value = r
+	} else if err := m.writeSlot(value); err != nil {
+		return EpochRecord{}, err
 	}
 	if inst > m.maxSeen {
 		m.maxSeen = inst

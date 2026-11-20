@@ -25,8 +25,10 @@ CONSTANTS Nodes,      \* node ids, natural numbers 1..N
           MaxEpoch,   \* epochs 1..MaxEpoch
           MaxRec,     \* records per epoch
           MaxRound,   \* ballots a node may start per run of the model
-          SlotLast    \* TRUE: look for a later epoch's slot after the ballot
+          SlotLast,   \* TRUE: look for a later epoch's slot after the ballot
                       \* blocks (the code since the fix); FALSE: before them
+          TableCheck  \* TRUE: a ballot consults the epoch table after its
+                      \* phase 1 survey (the code since the fix)
 
 N == Cardinality(Nodes)
 None == [owner |-> 0, cut |-> 0]
@@ -124,6 +126,7 @@ Withdraw(n) ==
 \* block is on disk.
 Accept(n) ==
   /\ pc[n] = "p1" /\ todo[n] = {}
+  /\ ~TableCheck \/ slot[ep[n]] = None
   /\ LET v == IF best[n].bal = 0
                 THEN [owner |-> n, cut |-> IF ep[n] = 1 THEN 0 ELSE len[ep[n] - 1]]
                 ELSE best[n].inp
@@ -135,13 +138,24 @@ Accept(n) ==
   /\ todo' = [todo EXCEPT ![n] = Nodes \ {n}]
   /\ UNCHANGED <<slot, len, acked, ep, best, wpos, rounds, readerVars>>
 
-\* Chosen: record it in the table if nobody has, and become owner if it
-\* names this node.
+\* The instance turns out to be decided already: the table says so, though
+\* no ballot block did.  Withdraw and go by the table.
+Decided(n) ==
+  /\ TableCheck /\ pc[n] = "p1" /\ todo[n] = {} /\ slot[ep[n]] # None
+  /\ pax' = Retreat(n)
+  /\ pc' = [pc EXCEPT ![n] = IF slot[ep[n]].owner = n THEN "own" ELSE "idle"]
+  /\ UNCHANGED <<slot, len, acked, ep, own, best, todo, val, wpos, rounds, readerVars>>
+
+\* Chosen: record it in the table if nobody has, and become owner if the
+\* table names this node.  Before the fix a node went by its own value even
+\* when the table already held another.
 WriteSlot(n) ==
   /\ pc[n] = "p2" /\ todo[n] = {}
-  /\ slot' = IF slot[ep[n]] = None THEN [slot EXCEPT ![ep[n]] = val[n]] ELSE slot
-  /\ pc' = [pc EXCEPT ![n] = IF val[n].owner = n THEN "own" ELSE "idle"]
-  /\ UNCHANGED <<pax, len, acked, ep, own, best, todo, val, wpos, rounds, readerVars>>
+  /\ LET final == IF slot[ep[n]] = None \/ ~TableCheck THEN val[n] ELSE slot[ep[n]]
+     IN /\ slot' = IF slot[ep[n]] = None THEN [slot EXCEPT ![ep[n]] = val[n]] ELSE slot
+        /\ val' = [val EXCEPT ![n] = final]
+        /\ pc' = [pc EXCEPT ![n] = IF final.owner = n THEN "own" ELSE "idle"]
+  /\ UNCHANGED <<pax, len, acked, ep, own, best, todo, wpos, rounds, readerVars>>
 
 \* A node finds the table naming it as owner of the latest epoch and takes
 \* it up: its ballot was finished by another node, or its lease lapsed and
@@ -232,7 +246,7 @@ RPax(r, j) ==
 
 ----------------------------------------------------------------------------
 Next ==
-  \/ \E n \in Nodes : StartBallot(n) \/ Withdraw(n) \/ Accept(n) \/ WriteSlot(n)
+  \/ \E n \in Nodes : StartBallot(n) \/ Withdraw(n) \/ Accept(n) \/ Decided(n) \/ WriteSlot(n)
                       \/ TakeUp(n) \/ Write(n) \/ CfSlot(n) \/ Crash(n)
   \/ \E n \in Nodes, j \in Nodes : Survey(n, j) \/ CfPax(n, j)
   \/ \E r \in Readers : RRead(r) \/ RSlot(r)
@@ -246,7 +260,7 @@ AckedSurvive == \A e \in Epochs : SlotAt(e + 1) # None => acked[e] <= slot[e + 1
 \* A reader never applies a record that a later epoch cuts off.
 ReadersAgree == \A r \in Readers, e \in Epochs : SlotAt(e + 1) # None => applied[r][e] <= slot[e + 1].cut
 
-\* A node that finishes a ballot instance arrives at the value in the table.
-OneValue == \A n \in Nodes :
-  (pc[n] = "p2" /\ todo[n] = {} /\ slot[ep[n]] # None) => slot[ep[n]] = val[n]
+\* A node acts as owner of an epoch only if the table names it.
+OneOwner == \A n \in Nodes :
+  pc[n] \in {"own", "cf_slot", "cf_pax"} => slot[ep[n]] # None /\ slot[ep[n]].owner = n
 =============================================================================
