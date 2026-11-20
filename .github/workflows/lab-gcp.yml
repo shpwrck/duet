@@ -28,9 +28,9 @@ jobs:
     timeout-minutes: 75
     env:
       # Set these three as repository variables; deploy/lab-gcp/setup.sh prints them.
-      TF_VAR_project: ${{ vars.GCP_PROJECT }}
-      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
-      GCP_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+      RAW_PROJECT: ${{ vars.GCP_PROJECT }}
+      RAW_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      RAW_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
       TF_IN_AUTOMATION: "true"
       DUET_TTL: ${{ inputs.ttl }}
     defaults:
@@ -38,6 +38,19 @@ jobs:
         working-directory: deploy/lab-gcp
     steps:
       - uses: actions/checkout@v4
+
+      # A variable pasted with a trailing newline breaks every API URL built
+      # from it, so strip whitespace before anything uses the values.
+      - name: Normalise identifiers
+        working-directory: .
+        run: |
+          clean() { printf '%s' "$1" | tr -d '[:space:]'; }
+          {
+            echo "TF_VAR_project=$(clean "$RAW_PROJECT")"
+            echo "GCP_SERVICE_ACCOUNT=$(clean "$RAW_SERVICE_ACCOUNT")"
+            echo "GCP_WIF_PROVIDER=$(clean "$RAW_WIF_PROVIDER")"
+          } >> "$GITHUB_ENV"
+          test -n "$(clean "$RAW_PROJECT")" || { echo "::error::repository variable GCP_PROJECT is not set"; exit 1; }
 
       - uses: actions/setup-go@v5
         with:
