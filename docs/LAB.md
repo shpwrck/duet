@@ -7,7 +7,7 @@ them is vSAN; results from each are labelled with where they came from.
 | --- | --- | --- |
 | Simulation (`pkg/node`) | All nodes in one process on an ideal in-memory disk, interleaved at single block operations | Runs in CI |
 | Processes (`test/proc`) | Real `duet` processes with direct I/O, a real clock and signals, on one disk image and one kernel | Runs locally |
-| Google Cloud (`deploy/lab-gcp`) | Two nodes in two zones on one regionally replicated multi-writer disk | Written, **not yet run** |
+| Google Cloud (`deploy/lab-gcp`) | Two nodes in two zones on one regionally replicated multi-writer disk | Run seven times; see [LAB-RUNS.md](LAB-RUNS.md) |
 
 ## Google Cloud lab
 
@@ -19,11 +19,16 @@ them is vSAN; results from each are labelled with where they came from.
 | VM stun | Freezing the process for four lease periods | The pause case exactly | Not a hypervisor-level stun |
 | Clustered VMDK reservations | NVMe persistent reservations on the same disk | Register, acquire, release | Google does not support preempt-and-abort, so the reservation backend must manage with preempt alone or acquire after release |
 
-Scenarios run by `run.sh`: baseline, throughput (128 writers), planned
-handover, owner frozen, owner killed, owner's VM stopped. Each records
+`run.sh` has two parts. The first drives duet's log directly: baseline,
+throughput (128 writers), planned handover, owner frozen, owner killed,
+owner's VM suspended and resumed, owner's VM hard reset. The second puts
+the same load through the etcd API on duet and on a three-member etcd
+cluster: baseline, throughput, planned stop of the leader, leader killed,
+and every member in the worst zone killed for 40 s. Each scenario records
 acknowledged writes, throughput, latency, the longest stretch with no
-acknowledged write, and whether every node agrees and no acknowledged
-write is missing.
+acknowledged write, and whether any acknowledged write is missing. The
+script first times the shared disk from each node, because that has
+differed two-fold between nodes and between runs.
 
 ### Running it
 

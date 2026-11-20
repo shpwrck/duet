@@ -3,8 +3,7 @@
 # a two-host vSAN cluster: one multi-writer disk, synchronously replicated
 # across two failure domains.
 #
-# NOT YET RUN. Written against the provider schema and Google's documented
-# limits; expect fixes on the first real apply.
+# Applied and destroyed by the lab-gcp workflow; see docs/LAB-RUNS.md.
 
 terraform {
   required_version = ">= 1.6"
