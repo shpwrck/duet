@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -153,33 +154,53 @@ type forwarder struct {
 	owner func() int
 	wait  time.Duration // how long a call waits for an owner to be known
 
+	// unreachable is the owner's id plus one once a full wait has failed
+	// to reach it, and zero otherwise.
+	unreachable atomic.Int64
+
 	mu    sync.Mutex
 	conns map[int]*grpc.ClientConn
 }
 
-// errNoOwner is plain Unavailable on purpose. etcd's own "no leader" error
-// makes the etcd client give up on a watch for good; Unavailable makes it
-// retry, which is right while an owner is being chosen.
-var errNoOwner = grpcstatus.Error(codes.Unavailable, "duet: no owner to forward to yet")
+// errNoOwner says that nothing was sent because there is no connection to
+// the owner. The wording is not free: it is the one Unavailable message
+// for which the etcd client retries a write on its next endpoint, because
+// it means the request never left. That is true here, and it is what lets
+// a client that knows both nodes keep working when this node cannot reach
+// the owner. (etcd's own "no leader" error would instead make the client
+// give up on a watch for good.)
+var errNoOwner = grpcstatus.Error(codes.Unavailable, "there is no connection available")
 
 // conn returns a ready connection to the node believed to own the log.
 // It waits a little for there to be one, instead of failing calls that
 // arrive during a takeover or just after this node started: nothing has
 // been sent yet, so waiting is safe, and to the client it looks like a
 // slow call, which is what an etcd member does during an election.
+//
+// If the wait runs out with the owner known but unreachable, later calls
+// fail at once until it is reachable again or the owner changes: the
+// nodes cannot see each other, and the client should use the other one.
 func (f *forwarder) conn(ctx context.Context) (*grpc.ClientConn, error) {
 	for deadline := time.Now().Add(f.wait); ; {
 		var c *grpc.ClientConn
-		if o := f.owner(); o >= 0 && o < len(f.peers) && o != f.self {
+		o := f.owner()
+		if o >= 0 && o < len(f.peers) && o != f.self {
 			c = f.dial(o)
 		}
 		if c != nil {
 			if c.GetState() == connectivity.Ready {
+				f.unreachable.Store(0)
 				return c, nil
 			}
 			c.Connect()
+			if f.unreachable.Load() == int64(o)+1 {
+				return nil, errNoOwner
+			}
 		}
 		if time.Now().After(deadline) {
+			if c != nil {
+				f.unreachable.Store(int64(o) + 1)
+			}
 			return nil, errNoOwner
 		}
 		select {

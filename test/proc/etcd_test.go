@@ -426,3 +426,92 @@ func TestClientPinnedToFollower(t *testing.T) {
 	}
 	t.Logf("%d steps through a follower across an owner kill; longest step %s", n, worst.Round(10*time.Millisecond))
 }
+
+// The two nodes cannot reach each other, but both reach the disk. The
+// standby cannot forward, so only the owner can serve. Ownership must not
+// move while the owner is alive, a client that knows both nodes must keep
+// working, and when the owner then dies the standby must take over.
+func TestNodesCannotReachEachOther(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts real processes; skipped with -short")
+	}
+	c, _ := setup(t)
+	eps := []string{freeAddr(t), freeAddr(t)}
+	dead := []string{freeAddr(t), freeAddr(t)} // nothing listens here: forwarding goes nowhere
+	for i := 0; i < 2; i++ {
+		c.nodes = append(c.nodes, c.start(i, freeAddr(t), "-etcd", eps[i], "-etcd-peers", strings.Join(dead, ","), "-state-dir", t.TempDir()))
+	}
+	defer func() {
+		for _, p := range c.nodes {
+			p.cmd.Process.Kill()
+			p.cmd.Wait()
+		}
+	}()
+	first := c.owner()
+	cli, err := clientv3.New(clientv3.Config{Endpoints: eps, DialTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	n, failed, worst := 0, 0, time.Duration(0)
+	step := func() {
+		start := time.Now()
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			get, err := cli.Get(ctx, "/n")
+			if err == nil {
+				val, mod := 0, int64(0)
+				if len(get.Kvs) == 1 {
+					val, _ = strconv.Atoi(string(get.Kvs[0].Value))
+					mod = get.Kvs[0].ModRevision
+				}
+				if val < n {
+					cancel()
+					t.Fatalf("read %d after writing %d: a stale read", val, n)
+				}
+				if val > n {
+					n = val
+					cancel()
+					break
+				}
+				var resp *clientv3.TxnResponse
+				resp, err = cli.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("/n"), "=", mod)).
+					Then(clientv3.OpPut("/n", strconv.Itoa(n+1))).Commit()
+				if err == nil && resp.Succeeded {
+					n++
+					cancel()
+					break
+				}
+			}
+			cancel()
+			if err != nil {
+				failed++
+			}
+			if time.Since(start) > 30*time.Second {
+				t.Fatalf("no progress for 30s with the nodes partitioned: %v", err)
+			}
+		}
+		if d := time.Since(start); d > worst {
+			worst = d
+		}
+	}
+	began := time.Now()
+	for n < 200 {
+		step()
+	}
+	if o := c.owner(); o.id != first.id {
+		t.Fatalf("ownership moved from node %d to node %d although the owner never stopped", first.id, o.id)
+	}
+	t.Logf("partitioned, owner alive: 200 steps in %s, %d failed calls, slowest step %s",
+		time.Since(began).Round(100*time.Millisecond), failed, worst.Round(10*time.Millisecond))
+
+	first.cmd.Process.Kill()
+	first.cmd.Wait()
+	failed, worst, began = 0, 0, time.Now()
+	for target := n + 200; n < target; {
+		step()
+	}
+	t.Logf("owner killed while partitioned: 200 steps in %s, %d failed calls, slowest step %s",
+		time.Since(began).Round(100*time.Millisecond), failed, worst.Round(10*time.Millisecond))
+}
