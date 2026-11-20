@@ -100,6 +100,15 @@ func (n *Node) Epoch() uint64 {
 	return n.cur.Epoch
 }
 
+// Owner returns the node that owns the epoch this node is reading, or -1
+// if it has read nothing yet. It can be out of date by one takeover.
+func (n *Node) Owner() int {
+	if !n.started {
+		return -1
+	}
+	return n.cur.Owner
+}
+
 // NextIndex is the index of the next record this node expects.
 func (n *Node) NextIndex() uint64 { return n.next }
 

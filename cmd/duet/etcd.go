@@ -37,6 +37,12 @@ gather:
 	s.publish()
 }
 
+func (s *server) ownerID() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ownerNode
+}
+
 func (s *server) isOwner() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -97,53 +103,62 @@ func (b etcdBackend) ReadBarrier(ctx context.Context) error {
 	return notOwner(<-done)
 }
 
-// followOwnership opens the etcd listener when this node becomes the owner
-// and closes it, dropping every connection, when it stops being the owner.
+// startEtcd opens the etcd listener, which stays open for the life of the
+// process whoever owns the log. Connections are served by one of two gRPC
+// servers: the real one while this node owns the log, and otherwise a
+// proxy that forwards every call to the owner.
 //
-// The stock etcd client stays on an endpoint for as long as its connection
-// is up, whatever errors that endpoint returns, because every etcd member
-// can serve or forward any request. duet has no forwarding yet, so the
-// owner is the only node that listens. The cost: followers serve nothing,
-// not even reads that tolerate staleness.
-func (s *server) followOwnership(owner bool) {
-	if s.etcdAddr == "" {
-		return
-	}
-	if !owner {
-		if s.etcdSrv != nil {
-			go s.etcdSrv.Stop()
-			s.etcdSrv = nil
-			s.st.Lessor().Demote()
-		}
-		return
-	}
-	if s.etcdSrv != nil {
-		return
-	}
-	lis, err := net.Listen("tcp", s.etcdAddr)
+// Followers must listen. An etcd client keeps to an endpoint while its
+// connection is up, and backs off for longer and longer from an endpoint
+// that refuses connections, so a node that only listened while it was the
+// owner was reached late after every handover.
+func (s *server) startEtcd(addr string, peers []string) error {
+	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Printf("node %d: etcd API: %v", s.id, err)
-		return
+		return err
 	}
-	srv := grpc.NewServer()
+	s.front = newFront(lis)
+	s.fwd = &forwarder{peers: peers, self: s.id, owner: s.ownerID, conns: map[int]*grpc.ClientConn{}}
+
+	real := grpc.NewServer()
 	b, member := etcdBackend{s}, uint64(s.id+1)
 	kv := api.NewKV(b, 1, member)
-	pb.RegisterKVServer(srv, kv)
+	pb.RegisterKVServer(real, kv)
 	watch := api.NewWatch(b, 1, member)
 	watch.Progress = s.watchProgress
-	pb.RegisterWatchServer(srv, watch)
-	pb.RegisterLeaseServer(srv, api.NewLease(kv))
-	pb.RegisterMaintenanceServer(srv, api.NewMaintenance(kv))
-	// Leases count down only on the owner. A new owner gives every lease
-	// one more disk-lease period, since keep-alives sent to the old owner
-	// during the takeover were lost.
-	s.st.Lessor().Promote(s.l.TTL)
-	go func() {
-		if err := srv.Serve(lis); err != nil {
-			log.Printf("node %d: etcd API: %v", s.id, err)
-		}
-	}()
-	s.etcdSrv = srv
+	pb.RegisterWatchServer(real, watch)
+	pb.RegisterLeaseServer(real, api.NewLease(kv))
+	pb.RegisterMaintenanceServer(real, api.NewMaintenance(kv))
+	proxy := grpc.NewServer(grpc.ForceServerCodecV2(rawCodec{}), grpc.UnknownServiceHandler(s.fwd.handle))
+	go real.Serve(s.front.listeners[modeOwner])
+	go proxy.Serve(s.front.listeners[modeFollower])
+	go s.front.accept()
+	log.Printf("node %d: etcd API on %s", s.id, addr)
+	return nil
+}
+
+// followOwnership switches the etcd listener between serving and
+// forwarding, dropping the connections of the mode being left so that
+// clients reconnect into the new one.
+func (s *server) followOwnership(owner bool) {
+	if s.front == nil {
+		return
+	}
+	mode := modeFollower
+	if owner {
+		mode = modeOwner
+	}
+	if !s.front.set(mode) {
+		return
+	}
+	if owner {
+		// Leases count down only on the owner. A new owner gives every
+		// lease one more disk-lease period, since keep-alives sent to the
+		// old owner during the takeover were lost.
+		s.st.Lessor().Promote(s.l.TTL)
+	} else {
+		s.st.Lessor().Demote()
+	}
 }
 
 // expireLeases turns leases that have run out into revokes in the log, so

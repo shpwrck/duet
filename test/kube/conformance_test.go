@@ -84,13 +84,13 @@ func TestMain(m *testing.M) {
 				panic(fmt.Sprintf("format: %v\n%s", err, out))
 			}
 		}
+		endpoints = []string{freeAddr(), freeAddr()}
 		for i := 0; i < 2; i++ {
-			ep := freeAddr()
-			endpoints = append(endpoints, ep)
+			ep := endpoints[i]
 			state := filepath.Join(dir, fmt.Sprint("state", i))
 			os.Mkdir(state, 0o700)
 			cmd := exec.Command(bin, "run", "-device", img, "-node", fmt.Sprint(i), "-listen", freeAddr(),
-				"-etcd", ep, "-state-dir", state, "-start-delay", "200ms", "-watch-progress-interval", "1s", direct)
+				"-etcd", ep, "-etcd-peers", strings.Join(endpoints, ","), "-state-dir", state, "-start-delay", "200ms", "-watch-progress-interval", "1s", direct)
 			cmd.Stderr = os.Stderr
 			if err := cmd.Start(); err != nil {
 				panic(err)

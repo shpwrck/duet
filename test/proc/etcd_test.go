@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,11 +23,9 @@ func TestEtcdClientAcrossKill(t *testing.T) {
 		t.Skip("starts real processes; skipped with -short")
 	}
 	c, _ := setup(t)
-	var eps []string
+	eps := []string{freeAddr(t), freeAddr(t), freeAddr(t)}
 	for i := 0; i < 3; i++ {
-		ep := freeAddr(t)
-		eps = append(eps, ep)
-		c.nodes = append(c.nodes, c.start(i, freeAddr(t), "-etcd", ep, "-state-dir", t.TempDir()))
+		c.nodes = append(c.nodes, c.start(i, freeAddr(t), "-etcd", eps[i], "-etcd-peers", strings.Join(eps, ","), "-state-dir", t.TempDir()))
 	}
 	defer func() {
 		for _, p := range c.nodes {
@@ -203,12 +202,13 @@ func TestRestartFromCheckpoint(t *testing.T) {
 		t.Skip("starts real processes; skipped with -short")
 	}
 	c, _ := setup(t)
-	var eps, addrs, dirs []string
+	eps := []string{freeAddr(t), freeAddr(t), freeAddr(t)}
+	var addrs, dirs []string
 	args := func(i int) []string {
-		return []string{"-etcd", eps[i], "-state-dir", dirs[i], "-checkpoint-every", "1500"}
+		return []string{"-etcd", eps[i], "-etcd-peers", strings.Join(eps, ","), "-state-dir", dirs[i], "-checkpoint-every", "1500"}
 	}
 	for i := 0; i < 3; i++ {
-		eps, addrs, dirs = append(eps, freeAddr(t)), append(addrs, freeAddr(t)), append(dirs, t.TempDir())
+		addrs, dirs = append(addrs, freeAddr(t)), append(dirs, t.TempDir())
 		c.nodes = append(c.nodes, c.start(i, addrs[i], args(i)...))
 	}
 	defer func() {
@@ -306,4 +306,114 @@ func TestRestartFromCheckpoint(t *testing.T) {
 			t.Fatalf("key %d: %s=%s at revision %d", i, kv.Key, kv.Value, kv.ModRevision)
 		}
 	}
+}
+
+// A client that knows only one node, which never owns the log, still gets
+// linearizable reads, writes and watch events, across a change of owner.
+func TestClientPinnedToFollower(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts real processes; skipped with -short")
+	}
+	c, _ := setup(t)
+	eps := []string{freeAddr(t), freeAddr(t), freeAddr(t)}
+	for i := 0; i < 3; i++ {
+		args := []string{"-etcd", eps[i], "-etcd-peers", strings.Join(eps, ","), "-state-dir", t.TempDir()}
+		if i == 2 {
+			args = append(args, "-campaign=false") // node 2 never owns the log
+		}
+		c.nodes = append(c.nodes, c.start(i, freeAddr(t), args...))
+	}
+	defer func() {
+		for _, p := range c.nodes {
+			p.cmd.Process.Kill()
+			p.cmd.Wait()
+		}
+	}()
+	first := c.owner()
+	cli, err := clientv3.New(clientv3.Config{Endpoints: eps[2:], DialTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	wctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var mu sync.Mutex
+	var seen []int
+	go func() {
+		for r := range cli.Watch(wctx, "/n", clientv3.WithRev(1)) {
+			mu.Lock()
+			for _, e := range r.Events {
+				v, _ := strconv.Atoi(string(e.Kv.Value))
+				seen = append(seen, v)
+			}
+			mu.Unlock()
+		}
+	}()
+	// Each step reads the value back before writing the next, so a stale
+	// read from the follower's own state would break the sequence.
+	n, worst := 0, time.Duration(0)
+	step := func() {
+		start := time.Now()
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			get, err := cli.Get(ctx, "/n")
+			if err == nil {
+				val, mod := 0, int64(0)
+				if len(get.Kvs) == 1 {
+					val, _ = strconv.Atoi(string(get.Kvs[0].Value))
+					mod = get.Kvs[0].ModRevision
+				}
+				if val < n {
+					cancel()
+					t.Fatalf("read %d after writing %d: a stale read", val, n)
+				}
+				if val > n {
+					n = val // an earlier attempt landed although the client saw an error
+					cancel()
+					break
+				}
+				var resp *clientv3.TxnResponse
+				resp, err = cli.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision("/n"), "=", mod)).
+					Then(clientv3.OpPut("/n", strconv.Itoa(n+1))).Commit()
+				if err == nil && resp.Succeeded {
+					n++
+					cancel()
+					break
+				}
+			}
+			cancel()
+			if time.Since(start) > 20*time.Second {
+				t.Fatalf("no progress through the follower for 20s: %v", err)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if d := time.Since(start); d > worst {
+			worst = d
+		}
+	}
+	for n < 300 {
+		step()
+	}
+	first.cmd.Process.Kill()
+	first.cmd.Wait()
+	for target := n + 300; n < target; {
+		step()
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		mu.Lock()
+		got := append([]int(nil), seen...)
+		mu.Unlock()
+		if len(got) >= n || time.Now().After(deadline) {
+			if len(got) != n {
+				t.Fatalf("watch through the follower saw %d events, want %d", len(got), n)
+			}
+			for i, v := range got {
+				if v != i+1 {
+					t.Fatalf("watch event %d carries %d", i, v)
+				}
+			}
+			break
+		}
+	}
+	t.Logf("%d steps through a follower across an owner kill; longest step %s", n, worst.Round(10*time.Millisecond))
 }

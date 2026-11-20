@@ -45,15 +45,18 @@ image file as the shared disk):
 - With kubectl: namespaces, 50 configmaps, a patch, a delete, a paged
   list, a Deployment object, a CustomResourceDefinition and an object of
   that kind all behaved normally.
-- **Owner killed under load:** 398 of 400 creates acknowledged; none
-  missing afterwards; an open `kubectl get --watch` saw all 398. The API
-  accepted writes again 7.8 s after the kill.
-- **Planned handover (SIGTERM to the owner):** no acknowledged create
-  lost, and duet changed owner in 0.2 s, **but kube-apiserver did not
-  write again for 18 s.** Likely cause, not yet confirmed: only the owner
-  listens, so the other node had been refusing connections for a minute,
-  and the etcd client was backing off between reconnect attempts when it
-  became the owner. Followers need to keep listening.
+- **Owner killed under load** (two runs): 353 and 360 of 400 creates
+  acknowledged; none missing afterwards; an open `kubectl get --watch`
+  saw every acknowledged one. The API accepted writes again 2.3 to 2.6 s
+  after the kill.
+- **Planned handover** (SIGTERM to the owner): 149 and 150 of 150
+  acknowledged, none missing, longest gap between writes 0.1 s.
+
+An earlier version let only the owner listen. kube-apiserver then took
+7.8 s to recover from the kill and 18 s from a planned handover that duet
+itself completed in 0.2 s, because its etcd client was backing off from
+an endpoint that had been refusing connections. Now every node listens
+and a node that does not own the log forwards to the one that does.
 
 Not exercised: controllers, scheduler, kubelets, any real workload, more
 than a few hundred objects, or any of this on separate machines.

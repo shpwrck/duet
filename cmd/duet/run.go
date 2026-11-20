@@ -15,12 +15,11 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"google.golang.org/grpc"
 
 	"github.com/shpwrck/duet/pkg/disk"
 	"github.com/shpwrck/duet/pkg/lease"
@@ -90,11 +89,12 @@ type server struct {
 	carry   *appendReq // a request that did not fit in the previous batch
 	backoff time.Time  // do not campaign again before this
 
-	mu    sync.RWMutex
-	sums  [][32]byte // sha256 of each applied payload, by index-1
-	chain [32]byte   // hash chain over sums; equal chains mean equal logs
-	owner bool
-	epoch uint64
+	mu        sync.RWMutex
+	sums      [][32]byte // sha256 of each applied payload, by index-1
+	chain     [32]byte   // hash chain over sums; equal chains mean equal logs
+	owner     bool
+	epoch     uint64
+	ownerNode int // who this node believes owns the log; -1 if unknown
 
 	base uint64 // records before this index came from a checkpoint
 
@@ -105,9 +105,9 @@ type server struct {
 	ckptBusy      atomic.Bool
 	ckptDone      atomic.Uint64
 	st            *sm.Store
-	etcdAddr      string
 	watchProgress time.Duration
-	etcdSrv       *grpc.Server // non-nil only while this node is the owner
+	front         *front
+	fwd           *forwarder
 	barriers      chan chan error
 	collect       bool        // true while the loop is inside Append
 	results       []sm.Result // results of the batch being appended
@@ -130,7 +130,7 @@ func (s *server) apply(index uint64, payload []byte) {
 func (s *server) publish() {
 	s.mu.Lock()
 	was := s.owner
-	s.owner, s.epoch = s.n.IsOwner(), s.n.Epoch()
+	s.owner, s.epoch, s.ownerNode = s.n.IsOwner(), s.n.Epoch(), s.n.Owner()
 	now := s.owner
 	s.mu.Unlock()
 	s.followOwnership(now)
@@ -314,6 +314,7 @@ func cmdRun(args []string) error {
 	direct := fs.Bool("direct", true, "use direct I/O (required when nodes are on different machines)")
 	campaign := fs.Bool("campaign", true, "stand for ownership; false makes a read-only follower")
 	etcdListen := fs.String("etcd", "", "address for the etcd v3 gRPC API; empty leaves it off and the log carries opaque payloads")
+	etcdPeers := fs.String("etcd-peers", "", "comma-separated etcd API addresses of all nodes, in node id order; lets a node that does not own the log forward calls to the one that does")
 	stateDir := fs.String("state-dir", "", "directory for the etcd state machine's files (rebuilt from the log at every start); default is the system temporary directory")
 	ckptEvery := fs.Uint64("checkpoint-every", 100000, "write a checkpoint of the etcd state after this many records; 0 never. Needs a disk formatted with -checkpoint-size")
 	watchProgress := fs.Duration("watch-progress-interval", 10*time.Minute, "how often idle watchers that asked for progress notifications get one (etcd's --watch-progress-notify-interval; kubeadm sets 5s)")
@@ -331,7 +332,7 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	s := &server{id: *id, l: l, reqs: make(chan *appendReq, 8192)}
+	s := &server{id: *id, l: l, ownerNode: -1, reqs: make(chan *appendReq, 8192)}
 	var cursor node.Cursor
 	if *etcdListen != "" {
 		s.dev, s.ckptEvery = dev, *ckptEvery
@@ -340,7 +341,7 @@ func cmdRun(args []string) error {
 		}
 		defer s.st.Close()
 		s.barriers = make(chan chan error, 8192)
-		s.etcdAddr, s.watchProgress = *etcdListen, *watchProgress
+		s.watchProgress = *watchProgress
 	}
 	s.n, err = node.New(dev, realClock{time.Now()},
 		lease.Config{Node: *id, Incarnation: uint64(time.Now().UnixNano()), Drift: *drift}, s.apply)
@@ -364,6 +365,13 @@ func cmdRun(args []string) error {
 		}
 	}()
 	if s.st != nil {
+		var peers []string
+		if *etcdPeers != "" {
+			peers = strings.Split(*etcdPeers, ",")
+		}
+		if err := s.startEtcd(*etcdListen, peers); err != nil {
+			return err
+		}
 		go s.expireLeases(ctx)
 	}
 	log.Printf("node %d: serving on %s, lease %s, direct=%v", *id, *listen, l.TTL, *direct)

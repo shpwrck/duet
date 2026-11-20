@@ -10,7 +10,7 @@ set -euo pipefail
 KUBE_BIN=${KUBE_BIN:?directory holding kube-apiserver and kubectl}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 W=$(mktemp -d)
-trap 'pkill -9 -P $$ 2>/dev/null || true; kill -9 $(cat "$W"/*.pid 2>/dev/null) 2>/dev/null || true' EXIT
+trap 'pkill -9 -f "$W/" 2>/dev/null || true' EXIT
 (cd "$ROOT" && go build -o "$W/duet" ./cmd/duet)
 truncate -s 2G "$W/disk.img"
 D=-direct=true
@@ -18,7 +18,7 @@ fmt() { "$W/duet" format -device "$W/disk.img" -nodes 2 -ttl 2s -epoch-slots 256
 fmt || { D=-direct=false; fmt; }
 node() {
   mkdir -p "$W/s$1"
-  "$W/duet" run -device "$W/disk.img" -node "$1" -listen 127.0.0.1:710"$1" -etcd 127.0.0.1:2379"$1" \
+  "$W/duet" run -device "$W/disk.img" -node "$1" -listen 127.0.0.1:710"$1" -etcd 127.0.0.1:2379"$1" -etcd-peers 127.0.0.1:23790,127.0.0.1:23791 \
     -state-dir "$W/s$1" -watch-progress-interval 5s $D >>"$W/duet$1.log" 2>&1 &
   echo $! >"$W/duet$1.pid"
 }
@@ -54,4 +54,19 @@ echo "acknowledged creates: $(wc -l <"$W/acked") of 400"
 echo "acknowledged but missing: $missing"
 echo "acknowledged but not seen by the watch: $unseen"
 echo "first acknowledged create after the kill: ${first}s"
-[ "$missing" = 0 ] && [ "$unseen" = 0 ]
+
+# Planned handover: bring the killed node back, then stop the owner
+# gracefully under the same kind of load.
+node 0; sleep 5
+(for i in $(seq 150); do
+  if "${K[@]}" -n fo create cm "g$i" --from-literal=v="$i" >/dev/null 2>&1; then echo "g$i $(date +%s.%N)" >>"$W/acked2"; fi
+done) &
+LOAD=$!
+sleep 4; kill -TERM "$(cat "$W/duet1.pid")"
+wait $LOAD
+"${K[@]}" -n fo get cm -o name | sed 's#configmap/##' | sort >"$W/present"
+cut -d' ' -f1 "$W/acked2" | sort >"$W/names2"
+missing2=$(comm -23 "$W/names2" "$W/present" | wc -l)
+gap=$(awk 'NR>1 && $2-p>g{g=$2-p} {p=$2} END{printf "%.1f", g}' "$W/acked2")
+echo "planned handover: acknowledged $(wc -l <"$W/acked2") of 150, missing $missing2, longest gap ${gap}s"
+[ "$missing" = 0 ] && [ "$unseen" = 0 ] && [ "$missing2" = 0 ]
