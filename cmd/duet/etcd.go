@@ -18,7 +18,7 @@ import (
 
 // barrier answers every linearizable read that is waiting with one disk
 // read. The store already holds every acknowledged write, because the loop
-// applies a batch before it acknowledges it.
+// queues a batch for the state machine before this answer.
 func (s *server) barrier(first chan error) {
 	waiting := []chan error{first}
 gather:
@@ -31,9 +31,13 @@ gather:
 		}
 	}
 	err := s.n.Confirm()
-	for _, b := range waiting {
-		b <- err
-	}
+	// Answer behind everything already queued for the state machine, so
+	// the reads that follow see every write acknowledged before them.
+	s.applyQ <- applyTask{fn: func() {
+		for _, b := range waiting {
+			b <- err
+		}
+	}}
 	s.publish()
 }
 

@@ -12,6 +12,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -74,6 +75,10 @@ type appendResp struct {
 type status struct {
 	Checkpoint uint64 `json:"checkpoint"` // index of this node's last checkpoint
 	Restored   uint64 `json:"restored"`   // index of the checkpoint this node started from
+	Batches    uint64 `json:"batches"`    // log writes since start
+	Records    uint64 `json:"records"`    // records in those writes
+	AppendMs   uint64 `json:"append_ms"`  // time spent in them
+	ApplyMs    uint64 `json:"apply_ms"`   // spent applying to the state machine, on its own goroutine
 	Node       int    `json:"node"`
 	Owner      bool   `json:"owner"`
 	Epoch      uint64 `json:"epoch"`
@@ -98,6 +103,9 @@ type server struct {
 
 	base uint64 // records before this index came from a checkpoint
 
+	// Write-path counters, for finding where time goes.
+	statBatches, statRecords, statAppendNs, statApplyNs atomic.Uint64
+
 	// etcd mode only.
 	dev           disk.Device
 	ckptEvery     uint64
@@ -109,22 +117,57 @@ type server struct {
 	front         *front
 	fwd           *forwarder
 	barriers      chan chan error
-	collect       bool        // true while the loop is inside Append
-	results       []sm.Result // results of the batch being appended
+	pending       []*appendReq // requests of the batch being appended, not yet handed to the applier
+	applyQ        chan applyTask
+	applyDone     chan struct{}
 }
 
+// apply is called by the node, on the loop goroutine, for every record in
+// log order. In etcd mode it only queues the record: the state machine is
+// driven by its own goroutine, so that the loop can start the next disk
+// write while the previous batch is still being applied.
 func (s *server) apply(index uint64, payload []byte) {
 	if s.st != nil {
-		r := s.st.Apply(index, payload)
-		if s.collect {
-			s.results = append(s.results, r)
+		t := applyTask{index: index, payload: payload}
+		if s.pending != nil {
+			t.req, s.pending = s.pending[0], s.pending[1:]
 		}
+		s.applyQ <- t
 	}
 	sum := sha256.Sum256(payload)
 	s.mu.Lock()
 	s.sums = append(s.sums, sum)
 	s.chain = sha256.Sum256(append(s.chain[:], sum[:]...))
 	s.mu.Unlock()
+}
+
+// applyTask is one step for the state machine goroutine: a record to
+// apply, with the request waiting for its result if there is one, or a
+// function to run once everything queued before it has been applied.
+type applyTask struct {
+	index   uint64
+	payload []byte
+	req     *appendReq
+	fn      func()
+}
+
+// applier owns the state machine. Records reach it in log order and only
+// after they are acknowledged, so the store never holds a write that
+// could be lost, and a write is answered only once it has been applied.
+func (s *server) applier() {
+	defer close(s.applyDone)
+	for t := range s.applyQ {
+		if t.fn != nil {
+			t.fn()
+			continue
+		}
+		began := time.Now()
+		r := s.st.Apply(t.index, t.payload)
+		s.statApplyNs.Add(uint64(time.Since(began)))
+		if t.req != nil {
+			t.req.resp <- appendResp{index: t.index, result: r}
+		}
+	}
 }
 
 func (s *server) publish() {
@@ -194,15 +237,21 @@ gather:
 	for i, r := range batch {
 		payloads[i] = r.payload
 	}
-	s.collect, s.results = true, s.results[:0]
+	// In etcd mode the applier answers each request after applying it;
+	// apply hands it the requests in the order of this batch.
+	if s.st != nil {
+		s.pending = batch
+	}
+	began := time.Now()
 	idx, err := s.n.Append(payloads)
-	s.collect = false
-	for i, r := range batch {
-		resp := appendResp{index: idx + uint64(i), err: err}
-		if err == nil && s.st != nil {
-			resp.result = s.results[i]
+	s.pending = nil
+	s.statBatches.Add(1)
+	s.statRecords.Add(uint64(len(batch)))
+	s.statAppendNs.Add(uint64(time.Since(began)))
+	if err != nil || s.st == nil {
+		for i, r := range batch {
+			r.resp <- appendResp{index: idx + uint64(i), err: err}
 		}
-		r.resp <- resp
 	}
 	s.publish()
 }
@@ -285,6 +334,8 @@ func (s *server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	st := status{Node: s.id, Owner: s.owner, Epoch: s.epoch,
 		Checkpoint: s.ckptDone.Load(), Restored: s.base,
+		Batches: s.statBatches.Load(), Records: s.statRecords.Load(),
+		AppendMs: s.statAppendNs.Load() / 1e6, ApplyMs: s.statApplyNs.Load() / 1e6,
 		Applied: s.base + uint64(len(s.sums)), Chain: hex.EncodeToString(s.chain[:])}
 	s.mu.RUnlock()
 	json.NewEncoder(w).Encode(st)
@@ -340,6 +391,8 @@ func cmdRun(args []string) error {
 			return err
 		}
 		defer s.st.Close()
+		s.applyQ, s.applyDone = make(chan applyTask, 1<<16), make(chan struct{})
+		go s.applier()
 		s.barriers = make(chan chan error, 8192)
 		s.watchProgress = *watchProgress
 	}
@@ -357,6 +410,8 @@ func cmdRun(args []string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/append", s.handleAppend)
 	mux.HandleFunc("/status", s.handleStatus)
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 	mux.HandleFunc("/hashes", s.handleHashes)
 	srv := &http.Server{Addr: *listen, Handler: mux}
 	go func() {
@@ -376,6 +431,10 @@ func cmdRun(args []string) error {
 	}
 	log.Printf("node %d: serving on %s, lease %s, direct=%v", *id, *listen, l.TTL, *direct)
 	s.loop(ctx, l.TTL/5, *campaign)
+	if s.applyQ != nil {
+		close(s.applyQ) // let queued records finish before the store closes
+		<-s.applyDone
+	}
 	shutdown, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdown)

@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	pb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/pkg/v3/traceutil"
@@ -55,7 +56,7 @@ type Store struct {
 	be      backend.Backend
 	le      lease.Lessor
 	kv      mvcc.WatchableKV
-	applied uint64
+	applied atomic.Uint64
 }
 
 // Open creates an empty store in a new directory under dir. An empty dir
@@ -92,7 +93,9 @@ func Restore(dir string, snapshot io.Reader, applied uint64) (*Store, error) {
 	kv := mvcc.New(lg, be, le, mvcc.StoreConfig{})
 	// Revoking a lease deletes the keys attached to it.
 	le.SetRangeDeleter(func() lease.TxnDelete { return kv.Write(traceutil.TODO()) })
-	return &Store{lg: lg, dir: d, be: be, le: le, kv: kv, applied: applied}, nil
+	st := &Store{lg: lg, dir: d, be: be, le: le, kv: kv}
+	st.applied.Store(applied)
+	return st, nil
 }
 
 // Close releases the store and deletes its files.
@@ -128,11 +131,11 @@ func (s *Snapshot) Close() error                       { return s.snap.Close() }
 func (s *Store) Snapshot() *Snapshot {
 	s.be.ForceCommit()
 	snap := s.be.Snapshot()
-	return &Snapshot{Applied: s.applied, Size: snap.Size(), snap: snap}
+	return &Snapshot{Applied: s.applied.Load(), Size: snap.Size(), snap: snap}
 }
 
 // Applied is the index of the last command applied.
-func (s *Store) Applied() uint64 { return s.applied }
+func (s *Store) Applied() uint64 { return s.applied.Load() }
 
 // EtcdVersion is the etcd release whose storage code this package runs,
 // reported to clients that ask which etcd they are talking to.
@@ -154,10 +157,10 @@ func (s *Store) Hash() (uint32, int64, error) {
 // Apply applies the command stored at a log index. Commands must be
 // applied in index order, each exactly once.
 func (s *Store) Apply(index uint64, payload []byte) Result {
-	if index != s.applied+1 {
-		return Result{Index: index, Err: fmt.Errorf("sm: apply index %d after %d", index, s.applied)}
+	if index != s.applied.Load()+1 {
+		return Result{Index: index, Err: fmt.Errorf("sm: apply index %d after %d", index, s.applied.Load())}
 	}
-	s.applied = index
+	s.applied.Store(index)
 	res := Result{Index: index}
 	var c Command
 	if err := proto.Unmarshal(payload, &c); err != nil {
@@ -168,7 +171,7 @@ func (s *Store) Apply(index uint64, payload []byte) Result {
 	ctx := context.Background()
 	switch {
 	case c.Txn != nil:
-		res.Resp, _, res.Err = txn.Txn(ctx, s.lg, c.Txn, false, s.kv, s.le, false)
+		res.Resp, _, res.Err = txn.Txn(ctx, s.lg, c.Txn, true, s.kv, s.le, false)
 	case c.Put != nil:
 		res.Resp, _, res.Err = txn.Put(ctx, s.lg, s.le, s.kv, c.Put)
 	case c.DeleteRange != nil:

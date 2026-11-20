@@ -55,20 +55,37 @@ func (s *server) restoreFrom(stateDir string, m ckpt.Meta) (*sm.Store, error) {
 }
 
 // maybeCheckpoint starts a checkpoint when enough records have been
-// applied since the last one. It runs on the loop goroutine, between
-// applies, so the snapshot and the cursor describe the same moment; the
-// copy to disk then runs in the background.
+// applied since the last one. The loop decides and records the cursor; the
+// state machine goroutine takes the snapshot when it reaches that point;
+// the copy to disk then runs in the background.
 func (s *server) maybeCheckpoint() {
 	if s.st == nil || s.l.CkptSize == 0 || s.ckptEvery == 0 || s.ckptBusy.Load() {
 		return
 	}
-	applied, cur := s.st.Applied(), s.n.Cursor()
-	if applied < s.ckptLast+s.ckptEvery || cur.Next != applied+1 {
+	cur := s.n.Cursor()
+	if cur.Next == 0 {
 		return
 	}
-	snap := s.st.Snapshot()
+	applied := cur.Next - 1
+	if applied < s.ckptLast+s.ckptEvery {
+		return
+	}
 	s.ckptLast = applied
 	s.ckptBusy.Store(true)
+	// The snapshot is taken by the state machine goroutine once it has
+	// applied everything up to the cursor, which is everything queued
+	// before this task.
+	s.applyQ <- applyTask{fn: func() { s.checkpoint(applied, cur) }}
+}
+
+func (s *server) checkpoint(applied uint64, cur node.Cursor) {
+	snap := s.st.Snapshot()
+	if snap.Applied != applied {
+		log.Printf("node %d: checkpoint skipped: store is at index %d, cursor says %d", s.id, snap.Applied, applied)
+		snap.Close()
+		s.ckptBusy.Store(false)
+		return
+	}
 	go func() {
 		defer s.ckptBusy.Store(false)
 		defer snap.Close()
