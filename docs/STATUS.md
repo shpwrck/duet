@@ -17,19 +17,23 @@ show. For results on real machines see [LAB-RUNS.md](LAB-RUNS.md) and
 | Process-level fault test (`test/proc`) | Implemented: owner frozen and killed under load |
 | State machine: etcd's own storage, transaction and lease code driven by the log (`pkg/sm`) | Implemented |
 | etcd v3 gRPC API: KV, Watch, Lease, Maintenance Status (`pkg/api`, `duet run -etcd`) | Implemented for what kube-apiserver uses; passes the part of Kubernetes' own storage test suite listed in [test/kube](../test/kube/README.md); a real kube-apiserver (v1.37.2) ran against it through an owner kill with no acknowledged write lost. Nodes that do not own the log forward to the one that does; they do not serve reads themselves |
-| Checkpoints (`pkg/ckpt`) | Implemented: any node writes them, a restart loads the newest and replays the rest |
+| Checkpoints (`pkg/ckpt`) | Implemented: any node writes them. A node with nothing on its own disk loads the newest and replays the rest |
+| Restart from the node's own state file (`pkg/sm`) | Implemented: the applied index is written in every database commit, as etcd does it; tested at 324 crash points and by killing both nodes at once under load |
+| State size limit | Implemented: new data is refused at nine tenths of a checkpoint slot, with etcd's own error. No defragment call yet |
 | Log reuse (`pkg/trim`, `pkg/node`, `duet retire`) | Implemented; tested in simulation with mutation tests and as processes over seven laps of a small log |
 | Epoch table reuse | Not planned; one slot per ownership change, sized at format time |
 | SCSI-3 reservation backend | Not started |
 | TLA+ model | Not started |
-| Google Cloud lab (`deploy/lab-gcp`) | Run seven times; results, including the comparison with three-member etcd, in [docs/LAB-RUNS.md](LAB-RUNS.md) |
+| TLS, authentication, backup and restore, defragment, member add and remove | Not started |
+| Google Cloud lab (`deploy/lab-gcp`) | Run eight times; results, including the comparison with three-member etcd, in [docs/LAB-RUNS.md](LAB-RUNS.md) |
 | Anything on vSAN | Not started; needs a lab |
 
 ## Tests
 
 ```
 go test -short ./...             # simulation only, a few seconds
-go test ./...                    # adds real processes, about 30 seconds
+go test ./...                    # adds real processes, about 3 minutes
+BIN=/dir/with/duet+etcdctl test/soak.sh 19   # random faults for 9 minutes
 DUET_SEEDS=6000 go test ./pkg/node -run TestRandomSchedules -v   # soak
 ```
 
@@ -57,3 +61,24 @@ What that does and does not show:
   and is the first thing to test on real hardware.
 - Passing tests are evidence, not proof. A TLA+ model and independent
   testing are planned before any production claim.
+
+## Through the etcd API
+
+These run the real binary and the stock etcd client, on one machine unless
+the lab is named.
+
+| Question | Test | Result |
+| --- | --- | --- |
+| Does every read see the latest write, across owner changes? | `TestLinearizable`: recorded history checked with porcupine | About 21,000 operations across a kill, a planned stop and a kill; linearizable in every run so far |
+| Is an acknowledged write ever lost? | Every lab and soak scenario verifies each acknowledged key afterwards | None lost in 8 lab runs or in a 9 minute soak of 583,385 writes with a random fault every 20 s |
+| Does it survive both nodes dying at once? | `TestBothNodesKilledContinueFromLocalState` | Four double kills under load; state identical to a node built from the shared disk alone |
+| Can the nodes be cut off from each other but not from the disk? | `TestNodesCannotReachEachOther` | Clients move to the owner; no second owner appears |
+| Does the log wrap safely? | `TestLogReuse`, `test/soak.sh` | More than seven laps with owner kills, a frozen standby and a dead owner |
+| What happens when the state outgrows its space? | `TestQuotaKeepsStateCheckpointable` | New data refused; deletes, reads and checkpoints continue |
+| How does it compare with etcd on reads, lists and watches? | `duet etcdbench` | Level on reads and lists ([numbers](../test/kube/README.md#reads-lists-and-watches)) |
+| How does it compare with etcd under faults, on real zones? | Lab run 8 | Far better when a zone is lost (2.5 s against 46 s), level or slightly behind for single leader faults, behind on a full cold start at the time of that run ([numbers](LAB-RUNS.md)) |
+
+What these do not show: anything on vSAN; state of several gigabytes; a
+soak of hours; a control plane larger than 100 simulated nodes and 3,000
+pods; more than two duet nodes in a lab; behaviour when the shared disk
+itself is slow or returns errors, other than in simulation.
