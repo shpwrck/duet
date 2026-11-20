@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -60,10 +61,30 @@ type Store struct {
 // Open creates an empty store in a new directory under dir. An empty dir
 // uses the system temporary directory; put it on tmpfs to keep the state
 // in memory.
-func Open(dir string) (*Store, error) {
+func Open(dir string) (*Store, error) { return Restore(dir, nil, 0) }
+
+// Restore creates a store from a snapshot taken by Snapshot on any replica
+// when that replica's Applied was applied. A nil snapshot gives an empty
+// store.
+func Restore(dir string, snapshot io.Reader, applied uint64) (*Store, error) {
 	d, err := os.MkdirTemp(dir, "duet-sm-")
 	if err != nil {
 		return nil, err
+	}
+	if snapshot != nil {
+		f, err := os.OpenFile(filepath.Join(d, "db"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			if _, err = io.Copy(f, snapshot); err == nil {
+				err = f.Sync()
+			}
+			if e := f.Close(); err == nil {
+				err = e
+			}
+		}
+		if err != nil {
+			os.RemoveAll(d)
+			return nil, err
+		}
 	}
 	lg := zap.NewNop()
 	be := backend.NewDefaultBackend(lg, filepath.Join(d, "db"))
@@ -71,7 +92,7 @@ func Open(dir string) (*Store, error) {
 	kv := mvcc.New(lg, be, le, mvcc.StoreConfig{})
 	// Revoking a lease deletes the keys attached to it.
 	le.SetRangeDeleter(func() lease.TxnDelete { return kv.Write(traceutil.TODO()) })
-	return &Store{lg: lg, dir: d, be: be, le: le, kv: kv}, nil
+	return &Store{lg: lg, dir: d, be: be, le: le, kv: kv, applied: applied}, nil
 }
 
 // Close releases the store and deletes its files.
@@ -90,6 +111,25 @@ func (s *Store) KV() mvcc.WatchableKV { return s.kv }
 
 // Lessor exposes the lease manager.
 func (s *Store) Lessor() lease.Lessor { return s.le }
+
+// Snapshot is a consistent copy of a store as of one log index.
+type Snapshot struct {
+	Applied uint64
+	Size    int64
+	snap    backend.Snapshot
+}
+
+// WriteTo writes the snapshot. It may run while the store keeps applying.
+func (s *Snapshot) WriteTo(w io.Writer) (int64, error) { return s.snap.WriteTo(w) }
+func (s *Snapshot) Close() error                       { return s.snap.Close() }
+
+// Snapshot captures the store as it is now. It must not run concurrently
+// with Apply. The caller must Close the result.
+func (s *Store) Snapshot() *Snapshot {
+	s.be.ForceCommit()
+	snap := s.be.Snapshot()
+	return &Snapshot{Applied: s.applied, Size: snap.Size(), snap: snap}
+}
 
 // Applied is the index of the last command applied.
 func (s *Store) Applied() uint64 { return s.applied }

@@ -53,6 +53,42 @@ func New(dev disk.Device, clock lease.Clock, cfg lease.Config, apply ApplyFunc) 
 	return &Node{dev: dev, l: l, m: m, apply: apply}, nil
 }
 
+// Cursor is a position in the log: everything before it has been applied.
+type Cursor struct {
+	Epoch  uint64 // the epoch being read
+	Offset int64  // where its next record goes
+	Next   uint64 // that record's index
+}
+
+// Cursor returns the node's read position. It is the zero Cursor until
+// the node has read something.
+func (n *Node) Cursor() Cursor {
+	if !n.started {
+		return Cursor{}
+	}
+	return Cursor{Epoch: n.cur.Epoch, Offset: n.off, Next: n.next}
+}
+
+// Seek starts a new node at a position taken from Cursor on any node of
+// the same disk, for a state machine restored to exactly that position.
+func (n *Node) Seek(c Cursor) error {
+	if n.started || n.w != nil {
+		return errors.New("node: Seek after the node has started reading")
+	}
+	if c == (Cursor{}) {
+		return nil
+	}
+	rec, st, err := n.m.ReadSlot(c.Epoch)
+	if err != nil {
+		return err
+	}
+	if st != disk.BlockValid || rec.Epoch != c.Epoch || c.Offset < rec.StartOffset || c.Next < rec.StartIndex {
+		return fmt.Errorf("%w: cursor %+v does not fit epoch record %+v", ErrCorrupt, c, rec)
+	}
+	n.cur, n.off, n.next, n.started = rec, c.Offset, c.Next, true
+	return nil
+}
+
 // IsOwner reports whether this node may acknowledge writes right now.
 func (n *Node) IsOwner() bool { return n.w != nil && n.m.Valid() }
 

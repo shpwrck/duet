@@ -33,6 +33,9 @@ type Layout struct {
 	LogSize    int64         // bytes reserved for the log
 	TTL        time.Duration // lease length, cluster-wide
 	MaxBatch   int           // largest single log write in bytes
+	// CkptSize is the space for one checkpoint, in bytes. Every node has
+	// two such slots. Zero means the disk holds no checkpoints.
+	CkptSize int64
 }
 
 func (l Layout) Validate() error {
@@ -47,6 +50,10 @@ func (l Layout) Validate() error {
 		return errors.New("disk: MaxBatch must be a positive multiple of BlockSize")
 	case l.LogSize < int64(4*l.MaxBatch):
 		return errors.New("disk: LogSize must hold at least four batches")
+	case l.LogSize%BlockSize != 0:
+		return errors.New("disk: LogSize must be a multiple of BlockSize")
+	case l.CkptSize < 0 || l.CkptSize%BlockSize != 0 || (l.CkptSize != 0 && l.CkptSize < 2*BlockSize):
+		return errors.New("disk: CkptSize must be zero or a multiple of BlockSize of at least two blocks")
 	}
 	return nil
 }
@@ -58,7 +65,12 @@ func (l Layout) SlotOff(epoch uint64) int64 {
 }
 func (l Layout) LogStart() int64 { return BlockSize * int64(1+2*l.Nodes+l.EpochSlots) }
 func (l Layout) LogEnd() int64   { return l.LogStart() + l.LogSize }
-func (l Layout) Total() int64    { return l.LogEnd() }
+
+// CkptOff is where one of a node's two checkpoint slots starts.
+func (l Layout) CkptOff(node, slot int) int64 {
+	return l.LogEnd() + int64(2*node+slot)*l.CkptSize
+}
+func (l Layout) Total() int64 { return l.LogEnd() + int64(2*l.Nodes)*l.CkptSize }
 
 // AlignUp rounds n up to the next multiple of BlockSize. Log batches start
 // and end on block boundaries so that every write is a whole number of
@@ -141,6 +153,13 @@ func Format(dev Device, l Layout) error {
 	if _, err := dev.WriteAt(zero, l.LogStart()); err != nil {
 		return err
 	}
+	for n := 0; n < l.Nodes && l.CkptSize > 0; n++ {
+		for slot := 0; slot < 2; slot++ {
+			if _, err := dev.WriteAt(zero, l.CkptOff(n, slot)); err != nil {
+				return err
+			}
+		}
+	}
 	p := make([]byte, 44)
 	binary.LittleEndian.PutUint32(p[0:], superMagic)
 	binary.LittleEndian.PutUint32(p[4:], formatVer)
@@ -149,6 +168,7 @@ func Format(dev Device, l Layout) error {
 	binary.LittleEndian.PutUint64(p[16:], uint64(l.LogSize))
 	binary.LittleEndian.PutUint64(p[24:], uint64(l.TTL))
 	binary.LittleEndian.PutUint32(p[32:], uint32(l.MaxBatch))
+	binary.LittleEndian.PutUint64(p[36:], uint64(l.CkptSize))
 	return WriteBlock(dev, 0, p)
 }
 
@@ -170,6 +190,9 @@ func Open(dev Device) (Layout, error) {
 		LogSize:    int64(binary.LittleEndian.Uint64(p[16:])),
 		TTL:        time.Duration(binary.LittleEndian.Uint64(p[24:])),
 		MaxBatch:   int(binary.LittleEndian.Uint32(p[32:])),
+	}
+	if len(p) >= 44 {
+		l.CkptSize = int64(binary.LittleEndian.Uint64(p[36:]))
 	}
 	if err := l.Validate(); err != nil {
 		return Layout{}, err

@@ -1,6 +1,9 @@
 package sm_test
 
 import (
+	"bytes"
+	"context"
+	"go.etcd.io/etcd/server/v3/storage/mvcc"
 	"testing"
 	"time"
 
@@ -150,5 +153,57 @@ func TestStoresFollowTheLogAcrossTakeover(t *testing.T) {
 	h1, r1, _ := stores[1].Hash()
 	if h0 != h1 || r0 != r1 || r0 != 5 {
 		t.Fatalf("stores differ after takeover: hash %d rev %d vs hash %d rev %d", h0, r0, h1, r1)
+	}
+}
+
+// A store restored from a snapshot continues exactly like the store the
+// snapshot was taken from, leases and compaction included.
+func TestSnapshotRestore(t *testing.T) {
+	a := open(t)
+	cmds := []*sm.Command{
+		casPut("/a", "1", 0),
+		{LeaseGrant: &pb.LeaseGrantRequest{ID: 7, TTL: 60}},
+		{Put: &pb.PutRequest{Key: []byte("/leased"), Value: []byte("x"), Lease: 7}},
+		casPut("/a", "2", 2),
+		{Compaction: &pb.CompactionRequest{Revision: 3}},
+	}
+	for i, c := range cmds {
+		if r := a.Apply(uint64(i+1), mustEncode(t, c)); r.Err != nil {
+			t.Fatal(r.Err)
+		}
+	}
+	snap := a.Snapshot()
+	var buf bytes.Buffer
+	if n, err := snap.WriteTo(&buf); err != nil || n != snap.Size || snap.Applied != 5 {
+		t.Fatalf("snapshot: %v, %d bytes of %d, applied %d", err, n, snap.Size, snap.Applied)
+	}
+	snap.Close()
+	b, err := sm.Restore(t.TempDir(), &buf, snap.Applied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	if b.Applied() != 5 || b.Revision() != a.Revision() {
+		t.Fatalf("restored at index %d revision %d, want 5 and %d", b.Applied(), b.Revision(), a.Revision())
+	}
+	more := []*sm.Command{
+		casPut("/a", "3", 4),
+		{LeaseRevoke: &pb.LeaseRevokeRequest{ID: 7}}, // must delete /leased on both
+		casPut("/b", "1", 0),
+	}
+	for i, c := range more {
+		p := mustEncode(t, c)
+		ra, rb := a.Apply(uint64(6+i), p), b.Apply(uint64(6+i), p)
+		if ra.Err != nil || rb.Err != nil || ra.Revision != rb.Revision {
+			t.Fatalf("command %d after restore: %v rev %d vs %v rev %d", i, ra.Err, ra.Revision, rb.Err, rb.Revision)
+		}
+	}
+	ha, ra, _ := a.Hash()
+	hb, rb, _ := b.Hash()
+	if ha != hb || ra != rb {
+		t.Fatalf("stores differ after restore: hash %d rev %d vs hash %d rev %d", ha, ra, hb, rb)
+	}
+	if rr, err := b.KV().Range(context.Background(), []byte("/leased"), nil, mvcc.RangeOptions{}); err != nil || len(rr.KVs) != 0 {
+		t.Fatalf("leased key survived revoke on the restored store: %v %+v", err, rr)
 	}
 }

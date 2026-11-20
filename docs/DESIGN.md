@@ -30,7 +30,8 @@ block 0              superblock: node count, epoch slots, log size, TTL, max bat
 blocks 1 .. N        lease block per node
 blocks N+1 .. 2N     Disk Paxos block per node
 next E blocks        epoch table: slot e-1 describes epoch e
-remainder            log
+next L bytes         log
+last 2N slots        checkpoints: two per node (optional)
 ```
 
 Metadata blocks are 4096 bytes with a CRC. A node writes only its own lease
@@ -132,6 +133,37 @@ clock kept running. It now models clocks that stop.
 
 A1 to A3 are the reason milestone 0 comes first.
 
+## Checkpoints
+
+A checkpoint is a copy of the state machine (etcd's database file) as of
+one log index, plus the log position that follows it. A starting node
+loads the newest intact checkpoint and replays only the log after it.
+
+- **Every node writes its own.** Each node has two checkpoint slots and
+  writes only to those. No agreement is needed, because a checkpoint adds
+  no information: nodes apply only acknowledged records, and the same log
+  gives the same state. A checkpoint by a node that has since been deposed
+  is still a correct state for its index. A follower can do the work, so
+  the owner does not have to.
+- **A crash cannot lose the previous one.** A node overwrites the older of
+  its two slots: it clears that slot's header, writes the state, then
+  writes the header with the state's checksum.
+- **Readers trust nothing.** A reader takes the highest index among all
+  headers, copies the state, and then checks the checksum and that the
+  header has not changed meanwhile. If either fails, it tries the next
+  newest, and with none left it replays the log from the start.
+- **The snapshot is taken between applies** on the node's single loop, so
+  the state and the log position describe the same moment. The copy to
+  disk runs in the background from a database snapshot.
+
+Not done yet: **the log is still never trimmed.** Checkpoints make
+trimming possible (records at or below the oldest checkpoint a node could
+need are dead) but the log is a linear region with no wrap-around, and
+the epoch table has no reuse. A state larger than a checkpoint slot
+cannot be checkpointed; the node logs the failure and carries on. On
+Kubernetes-sized state the copy will compete with the log for disk
+throughput, and that has not been measured.
+
 ## Decisions made
 
 | Decision | Value | Reason |
@@ -152,7 +184,7 @@ the same shape as EKS, so the EKS list is the plan:
 | --- | --- | --- |
 | Consensus moved to a journal | The shared disk is the journal | Implemented in simulation |
 | Replicas no longer bound by quorum | Any number of tailing readers | Implemented, tested with three |
-| In-memory database | State machine in memory, rebuilt from checkpoint plus log | Not started |
+| In-memory database | State machine in memory, rebuilt from checkpoint plus log | Implemented on etcd's database file in a state directory; put it on tmpfs to hold it in memory |
 | Key-space partitioning | One duet instance per resource group, each with its own disk and owner, wired through kube-apiserver's per-resource etcd overrides | Design only |
 | (implicit) batching | Group commit: one flush per batch | Implemented |
 
@@ -169,8 +201,9 @@ What stands between this repo and those numbers:
 - **One writer per partition.** Partitions spread writers across nodes, but
   a single hot resource type is still one writer. Spanner does not have
   this limit; Journal-based EKS does.
-- **The log is not trimmed and the epoch table is finite.** Checkpoints,
-  trimming and epoch slot reuse are required before any long run.
+- **The log is not trimmed and the epoch table is finite.** Checkpoints
+  exist; trimming and epoch slot reuse are still required before any
+  long run.
 - **Most of the scaling work at 100,000 nodes is outside the datastore**:
   consistent reads from the API server's cache, streaming lists, scheduler
   throughput. Those are upstream Kubernetes features and need a large test
@@ -188,7 +221,7 @@ GKE or EKS scale needs a load test at that scale.
 | 0 | Platform spike on a two-host vSAN cluster: A1 to A3, flush latency, reservation commands from Linux | Results table; go or no-go per ownership backend |
 | 1 | Baselines on the same disk: vSphere HA restart, Pacemaker with stock etcd | Recovery numbers; gate decision |
 | 2 | Ownership and log | **Done in simulation.** TLA+ model still to write. |
-| 3 | State machine and etcd API; checkpoints and trimming | kube-apiserver runs; upstream storage tests pass |
+| 3 | State machine and etcd API; checkpoints and trimming | kube-apiserver runs; upstream storage tests pass. **State: API, state machine and checkpoints done; most upstream storage tests pass (`test/kube`); kube-apiserver not yet run; no trimming.** |
 | 4 | Correctness harness on real processes and disks | Linearizability checker passes under faults |
 | 5 | Kubernetes demo on the lab and on vSAN | Conformance; recovery benchmark against milestone 1 |
 | 6 | Scale: partitions, in-memory state, load tests against the targets above | Measured throughput per partition; gap to targets stated |

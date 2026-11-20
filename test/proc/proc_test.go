@@ -98,7 +98,7 @@ func setup(t *testing.T) (*cluster, string) {
 	}
 	format := func() ([]byte, error) {
 		return exec.Command(c.bin, "format", "-device", c.device, "-nodes", "3", "-ttl", "1s",
-			"-epoch-slots", "256", "-max-batch", "262144", c.direct).CombinedOutput()
+			"-epoch-slots", "256", "-max-batch", "262144", "-checkpoint-size", "16777216", c.direct).CombinedOutput()
 	}
 	if out, err := format(); err != nil {
 		t.Logf("direct I/O unavailable, falling back to buffered: %s", out)

@@ -2,7 +2,9 @@ package proc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 	"sync"
 	"testing"
@@ -177,4 +179,131 @@ func TestEtcdClientAcrossKill(t *testing.T) {
 		t.Errorf("only %d acknowledged increments", total)
 	}
 	t.Logf("%d acknowledged increments across the kill", total)
+}
+
+type nodeStatus struct {
+	Owner                         bool
+	Applied, Checkpoint, Restored uint64
+}
+
+func (p *proc) status() (nodeStatus, error) {
+	var st nodeStatus
+	resp, err := (&http.Client{Timeout: time.Second}).Get(p.url + "/status")
+	if err != nil {
+		return st, err
+	}
+	defer resp.Body.Close()
+	return st, json.NewDecoder(resp.Body).Decode(&st)
+}
+
+// A node that restarts takes the newest checkpoint from the disk, replays
+// only the log after it, and can then serve everything as the owner.
+func TestRestartFromCheckpoint(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts real processes; skipped with -short")
+	}
+	c, _ := setup(t)
+	var eps, addrs, dirs []string
+	args := func(i int) []string {
+		return []string{"-etcd", eps[i], "-state-dir", dirs[i], "-checkpoint-every", "1500"}
+	}
+	for i := 0; i < 3; i++ {
+		eps, addrs, dirs = append(eps, freeAddr(t)), append(addrs, freeAddr(t)), append(dirs, t.TempDir())
+		c.nodes = append(c.nodes, c.start(i, addrs[i], args(i)...))
+	}
+	defer func() {
+		for _, p := range c.nodes {
+			p.cmd.Process.Kill()
+			p.cmd.Wait()
+		}
+	}()
+	owner := c.owner()
+	cli, err := clientv3.New(clientv3.Config{Endpoints: eps, DialTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	put := func(from, to int) {
+		t.Helper()
+		for i := from; i < to; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err := cli.Put(ctx, fmt.Sprintf("/k/%05d", i), strconv.Itoa(i))
+			cancel()
+			if err != nil {
+				t.Fatalf("put %d: %v", i, err)
+			}
+		}
+	}
+	put(0, 2000)
+
+	// Restart a node that is not the owner once any node has checkpointed.
+	victim := c.nodes[(owner.id+1)%3]
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		done := false
+		for _, p := range c.nodes {
+			if st, err := p.status(); err == nil && st.Checkpoint > 0 {
+				done = true
+			}
+		}
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no checkpoint within 10s")
+		}
+	}
+	victim.cmd.Process.Kill()
+	victim.cmd.Wait()
+	put(2000, 2300)
+	c.nodes[victim.id] = c.start(victim.id, addrs[victim.id], args(victim.id)...)
+	victim = c.nodes[victim.id]
+
+	want, err := owner.status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st nodeStatus
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		if st, err = victim.status(); err == nil && st.Applied >= want.Applied {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("restarted node did not catch up: %+v, want applied %d (%v)", st, want.Applied, err)
+		}
+	}
+	// With a checkpoint every 1500 records, the only checkpoints on disk
+	// were taken between 1500 and 2000, so the last 300 writes at least
+	// must come from the log.
+	if st.Restored < 1500 || st.Restored > 2001 || st.Applied == st.Restored {
+		t.Fatalf("restarted node should have used a checkpoint and then the log: %+v", st)
+	}
+	t.Logf("restarted node started from the checkpoint at index %d and replayed %d records", st.Restored, st.Applied-st.Restored)
+
+	// Leave only the restarted node, and read everything back through it.
+	for _, p := range c.nodes {
+		if p != victim {
+			p.cmd.Process.Kill()
+			p.cmd.Wait()
+		}
+	}
+	var get *clientv3.GetResponse
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		get, err = cli.Get(ctx, "/k/", clientv3.WithPrefix())
+		cancel()
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("restarted node never served: %v", err)
+		}
+	}
+	if len(get.Kvs) != 2300 {
+		t.Fatalf("restarted node has %d keys, want 2300", len(get.Kvs))
+	}
+	for i, kv := range get.Kvs {
+		if string(kv.Key) != fmt.Sprintf("/k/%05d", i) || string(kv.Value) != strconv.Itoa(i) || kv.ModRevision != int64(i+2) {
+			t.Fatalf("key %d: %s=%s at revision %d", i, kv.Key, kv.Value, kv.ModRevision)
+		}
+	}
 }

@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,6 +40,7 @@ func cmdFormat(args []string) error {
 	slots := fs.Int("epoch-slots", 4096, "how many ownership changes the disk can record")
 	logSize := fs.Int64("log-size", 0, "bytes for the log; 0 uses the rest of the device")
 	ttl := fs.Duration("ttl", 5*time.Second, "lease length")
+	ckptSize := fs.Int64("checkpoint-size", 0, "bytes for one checkpoint of the etcd state; every node gets two such slots; 0 means no checkpoints")
 	maxBatch := fs.Int("max-batch", 1<<20, "largest single log write in bytes")
 	direct := fs.Bool("direct", true, "use direct I/O")
 	fs.Parse(args)
@@ -47,9 +49,9 @@ func cmdFormat(args []string) error {
 		return err
 	}
 	defer dev.Close()
-	l := disk.Layout{Nodes: *nodes, EpochSlots: *slots, LogSize: *logSize, TTL: *ttl, MaxBatch: *maxBatch}
+	l := disk.Layout{Nodes: *nodes, EpochSlots: *slots, LogSize: *logSize, TTL: *ttl, MaxBatch: *maxBatch, CkptSize: *ckptSize}
 	if l.LogSize == 0 {
-		l.LogSize = dev.Size() - l.LogStart()
+		l.LogSize = (dev.Size() - l.LogStart() - int64(2*l.Nodes)*l.CkptSize) &^ (disk.BlockSize - 1)
 	}
 	if err := disk.Format(dev, l); err != nil {
 		return err
@@ -71,11 +73,13 @@ type appendResp struct {
 }
 
 type status struct {
-	Node    int    `json:"node"`
-	Owner   bool   `json:"owner"`
-	Epoch   uint64 `json:"epoch"`
-	Applied uint64 `json:"applied"`
-	Chain   string `json:"chain"`
+	Checkpoint uint64 `json:"checkpoint"` // index of this node's last checkpoint
+	Restored   uint64 `json:"restored"`   // index of the checkpoint this node started from
+	Node       int    `json:"node"`
+	Owner      bool   `json:"owner"`
+	Epoch      uint64 `json:"epoch"`
+	Applied    uint64 `json:"applied"`
+	Chain      string `json:"chain"`
 }
 
 type server struct {
@@ -92,7 +96,14 @@ type server struct {
 	owner bool
 	epoch uint64
 
+	base uint64 // records before this index came from a checkpoint
+
 	// etcd mode only.
+	dev           disk.Device
+	ckptEvery     uint64
+	ckptLast      uint64 // index at which the last checkpoint was started
+	ckptBusy      atomic.Bool
+	ckptDone      atomic.Uint64
 	st            *sm.Store
 	etcdAddr      string
 	watchProgress time.Duration
@@ -214,6 +225,7 @@ func (s *server) loop(ctx context.Context, tick time.Duration, campaign bool) {
 			return
 		case <-t.C:
 			s.maintain(campaign)
+			s.maybeCheckpoint()
 		case b := <-s.barriers:
 			s.barrier(b)
 		case r := <-s.reqs:
@@ -272,7 +284,8 @@ func (s *server) handleAppend(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	st := status{Node: s.id, Owner: s.owner, Epoch: s.epoch,
-		Applied: uint64(len(s.sums)), Chain: hex.EncodeToString(s.chain[:])}
+		Checkpoint: s.ckptDone.Load(), Restored: s.base,
+		Applied: s.base + uint64(len(s.sums)), Chain: hex.EncodeToString(s.chain[:])}
 	s.mu.RUnlock()
 	json.NewEncoder(w).Encode(st)
 }
@@ -283,12 +296,12 @@ func (s *server) handleHashes(w http.ResponseWriter, r *http.Request) {
 	to, _ := strconv.ParseUint(r.URL.Query().Get("to"), 10, 64)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if from < 1 || to > uint64(len(s.sums)) || from > to {
+	if from <= s.base || to > s.base+uint64(len(s.sums)) || from > to {
 		http.Error(w, "range not applied here", http.StatusNotFound)
 		return
 	}
 	for i := from; i <= to; i++ {
-		fmt.Fprintln(w, hex.EncodeToString(s.sums[i-1][:]))
+		fmt.Fprintln(w, hex.EncodeToString(s.sums[i-1-s.base][:]))
 	}
 }
 
@@ -302,6 +315,7 @@ func cmdRun(args []string) error {
 	campaign := fs.Bool("campaign", true, "stand for ownership; false makes a read-only follower")
 	etcdListen := fs.String("etcd", "", "address for the etcd v3 gRPC API; empty leaves it off and the log carries opaque payloads")
 	stateDir := fs.String("state-dir", "", "directory for the etcd state machine's files (rebuilt from the log at every start); default is the system temporary directory")
+	ckptEvery := fs.Uint64("checkpoint-every", 100000, "write a checkpoint of the etcd state after this many records; 0 never. Needs a disk formatted with -checkpoint-size")
 	watchProgress := fs.Duration("watch-progress-interval", 10*time.Minute, "how often idle watchers that asked for progress notifications get one (etcd's --watch-progress-notify-interval; kubeadm sets 5s)")
 	startDelay := fs.Duration("start-delay", time.Second, "wait before first touching the disk, so a previous process's last write has landed")
 	fs.Parse(args)
@@ -318,8 +332,10 @@ func cmdRun(args []string) error {
 		return err
 	}
 	s := &server{id: *id, l: l, reqs: make(chan *appendReq, 8192)}
+	var cursor node.Cursor
 	if *etcdListen != "" {
-		if s.st, err = sm.Open(*stateDir); err != nil {
+		s.dev, s.ckptEvery = dev, *ckptEvery
+		if cursor, err = s.restore(*stateDir); err != nil {
 			return err
 		}
 		defer s.st.Close()
@@ -329,6 +345,9 @@ func cmdRun(args []string) error {
 	s.n, err = node.New(dev, realClock{time.Now()},
 		lease.Config{Node: *id, Incarnation: uint64(time.Now().UnixNano()), Drift: *drift}, s.apply)
 	if err != nil {
+		return err
+	}
+	if err := s.n.Seek(cursor); err != nil {
 		return err
 	}
 
