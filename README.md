@@ -13,9 +13,11 @@ The idea is the one Amazon EKS uses at 100,000 nodes: take Raft out, keep a
 single writer, and push durability and ordering into a replicated log. Here
 the log is a shared disk.
 
-**Status: early.** The ownership protocol and the log exist, tested in
-simulation and as real processes on one machine. There is no etcd API yet,
-and nothing has run on vSAN. See
+**Status: early.** The ownership protocol and the log are tested in
+simulation, as real processes on one machine, and on two Google Cloud VMs
+sharing a replicated disk. The stock etcd client works against it across an
+owner failure. kube-apiserver has not been run against it yet, restarts
+replay the whole log, and nothing has run on vSAN. See
 [what exists](#what-exists-today) before drawing conclusions.
 
 ## How it works
@@ -47,18 +49,19 @@ safety argument.
 | Fault simulation and tests | Implemented, see below |
 | `duet` process: direct I/O, real clock, renewal loop, group commit (`cmd/duet`) | Implemented, with a temporary HTTP interface for testing |
 | Process-level fault test (`test/proc`) | Implemented: owner frozen and killed under load |
-| etcd gRPC API, state machine | Not started |
+| State machine: etcd's own storage, transaction and lease code driven by the log (`pkg/sm`) | Implemented; rebuilt by full replay at every start |
+| etcd v3 gRPC API: KV, Watch, Lease, Maintenance Status (`pkg/api`, `duet run -etcd`) | Implemented for what kube-apiserver uses; tested with the etcd client, not yet with kube-apiserver. Only the owner serves |
 | Checkpoints and log trimming | Not started |
 | SCSI-3 reservation backend | Not started |
 | TLA+ model | Not started |
-| Google Cloud lab (`deploy/lab-gcp`) | Written and schema-validated, not yet run |
+| Google Cloud lab (`deploy/lab-gcp`) | Run; results in [docs/LAB-RUNS.md](docs/LAB-RUNS.md). Tests the log, not yet the etcd API |
 | Anything on vSAN | Not started; needs a lab |
 
 ## Tests
 
 ```
 go test -short ./...             # simulation only, a few seconds
-go test ./...                    # adds real processes, about 20 seconds
+go test ./...                    # adds real processes, about 30 seconds
 DUET_SEEDS=6000 go test ./pkg/node -run TestRandomSchedules -v   # soak
 ```
 
