@@ -71,14 +71,15 @@ resource "google_compute_subnetwork" "lab" {
   ip_cidr_range = "10.90.0.0/24"
 }
 
-# Nodes and the client talk to each other on the test HTTP port.
+# Nodes and the client talk to each other on the test HTTP port and the
+# etcd client and peer ports.
 resource "google_compute_firewall" "internal" {
   name          = "${var.prefix}-internal"
   network       = google_compute_network.lab.id
   source_ranges = [google_compute_subnetwork.lab.ip_cidr_range]
   allow {
     protocol = "tcp"
-    ports    = ["7000"]
+    ports    = ["7000", "2379", "2380"]
   }
 }
 
@@ -140,9 +141,44 @@ resource "google_compute_instance" "node" {
   }
 }
 
+# Third member for the etcd control only. Three etcd members cannot be
+# spread evenly over two zones: this one shares a zone with node 0, so that
+# zone holds the majority.
+resource "google_compute_instance" "third" {
+  name         = "${var.prefix}-third"
+  zone         = var.zones[0]
+  machine_type = var.machine_type
+  labels       = { lab = var.prefix }
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-12"
+      type  = "hyperdisk-balanced"
+      size  = 10
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.lab.id
+  }
+
+  metadata = { enable-oslogin = "TRUE" }
+
+  scheduling {
+    automatic_restart           = false
+    on_host_maintenance         = "TERMINATE"
+    instance_termination_action = "DELETE"
+    max_run_duration {
+      seconds = var.max_run_seconds
+    }
+  }
+}
+
+# The load generator sits in the zone that does not hold the etcd majority,
+# so it survives the loss of the other zone.
 resource "google_compute_instance" "client" {
   name         = "${var.prefix}-client"
-  zone         = var.zones[0]
+  zone         = var.zones[1]
   machine_type = var.machine_type
   labels       = { lab = var.prefix }
 
@@ -176,6 +212,14 @@ output "nodes" {
     zone = n.zone
     ip   = n.network_interface[0].network_ip
   }]
+}
+
+output "third" {
+  value = {
+    name = google_compute_instance.third.name
+    zone = google_compute_instance.third.zone
+    ip   = google_compute_instance.third.network_interface[0].network_ip
+  }
 }
 
 output "client" {

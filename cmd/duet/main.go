@@ -32,6 +32,10 @@ func main() {
 		err = cmdLoad(os.Args[2:])
 	case "verify":
 		err = cmdVerify(os.Args[2:])
+	case "etcdload":
+		err = cmdEtcdLoad(os.Args[2:])
+	case "etcdverify":
+		err = cmdEtcdVerify(os.Args[2:])
 	default:
 		usage()
 	}

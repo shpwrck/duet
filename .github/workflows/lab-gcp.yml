@@ -59,6 +59,14 @@ jobs:
       - name: Build
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o duet ../../cmd/duet
 
+      - name: Fetch etcd for the control
+        run: |
+          V=v3.7.4
+          curl -fsSL -o etcd.tgz "https://github.com/etcd-io/etcd/releases/download/$V/etcd-$V-linux-amd64.tar.gz"
+          curl -fsSL -o SHA256SUMS "https://github.com/etcd-io/etcd/releases/download/$V/SHA256SUMS"
+          grep "etcd-$V-linux-amd64.tar.gz" SHA256SUMS | sed "s#etcd-$V-linux-amd64.tar.gz#etcd.tgz#" | sha256sum -c -
+          tar xzf etcd.tgz --strip-components=1 "etcd-$V-linux-amd64/etcd" "etcd-$V-linux-amd64/etcdctl"
+
       - uses: google-github-actions/auth@v3
         with:
           project_id: ${{ env.TF_VAR_project }}
