@@ -88,9 +88,9 @@ What it shows:
 - **The disk is slower from one zone, and that explains the swing in
   throughput between runs.** One synchronous 4 KiB write took 1.99 ms
   (p50) from node 0 in zone a and 1.16 ms from node 1 in zone b. In runs 4
-  and 7 the slow results were with node 0 as owner, and here the baseline
-  with node 0 as owner is 855 writes/s against 1,300 with node 1 in the
-  later scenarios. The disk is one regional volume; presumably it is
+  and 7 the slow results were with node 0 as owner, and here the baseline,
+  with node 0 as owner throughout, is 855 writes/s against about 1,300
+  in the scenarios where the fault moved ownership to node 1. The disk is one regional volume; presumably it is
   closer to one zone. On vSAN the equivalent question is which site holds
   the component the write waits for, and it should be measured there.
 - At 128 clients duet matched etcd in this run (7,871 against 7,786),
