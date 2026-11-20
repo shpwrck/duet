@@ -13,7 +13,7 @@ Every Google Cloud lab run, in order. The owner approved up to 20 runs on
 | 6 | 2026-11-20 11:04 | [44724515999](https://github.com/shpwrck/duet/actions/runs/44724515999) | Passed: all 17 scenarios verified, etcd's zone loss included. duet with a 2 s lease this time. **Raw log:** 26,450 writes/s with 128 writers; takeover after a kill 2.5 s, after freeze, suspend or reset 4.0 s. **etcd API, duet against three-member etcd:** 8 clients 1,791 vs 1,482 writes/s; 128 clients 6,771 vs 8,320; planned stop 0.3 s vs 3.0 s without writes; leader killed 2.6 s vs 1.1 s; worst zone lost for 40 s: duet 2.5 s without writes, etcd 46.2 s. Latency again depends on the owner: p50 3.9 ms on node 0, 7.6 ms on node 1. In runs 4 to 6 the slow owner is the one in the load generator's zone; not explained. |
 | 7 | 2026-11-20 12:51 | [44739258773](https://github.com/shpwrck/duet/actions/runs/44739258773) | Passed, all 17 verified. **Inconclusive for its purpose.** The shared disk was about twice as slow from node 0 this time (raw log p50 8.3 ms, 12,255 writes/s with 128 writers; node 1 at 4.5 ms), as in run 4 and the reverse of runs 5 and 6, with the same VMs in the same zones. So the cause is the disk on the day, not the load generator's zone as guessed after run 6, and not the code change run 4 was blamed for. Through the etcd API with that slow owner: 128 clients 7,000 writes/s (etcd 7,469); 8 clients 658 (etcd 1,467, on its own unaffected disks). Faults: stop 0.18 s vs 0.02 s; kill 2.2 s vs 3.0 s; zone loss 2.7 s vs 46.6 s. The script now times the disk from each node first and records duet's write-path counters. |
 | 8 | 2026-11-20 16:21 | [44772561551](https://github.com/shpwrck/duet/actions/runs/44772561551) | Passed, all 25 verified, torn down clean. First run with freeze, VM suspend, VM reset and all-members-down through the etcd API on both systems, with log reuse active and the disk timed from each node. See "Run 8" below. |
-| 9 | 2026-11-20 19:05 | pending | In progress when this row was written. First run with duet's etcd state file on each node's own disk instead of in memory, kept across restarts, so a restarted node continues from it. Runs 5 to 8 kept that file in memory (`/dev/shm`) and wiped it at every start, which spared duet a disk etcd was paying for; treat their throughput comparison with that in mind. |
+| 9 | 2026-11-20 18:52 | [44796905177](https://github.com/shpwrck/duet/actions/runs/44796905177) | Passed, all 25 verified, torn down clean. First run with duet's etcd state file on each node's own disk instead of in memory, kept across restarts. Runs 5 to 8 kept that file in memory (`/dev/shm`) and wiped it at every start. See "Run 9" below. |
 
 ## duet against etcd, runs 5 and 6
 
@@ -93,11 +93,51 @@ What it shows:
   (p50) from node 0 in zone a and 1.16 ms from node 1 in zone b. In runs 4
   and 7 the slow results were with node 0 as owner, and here the baseline,
   with node 0 as owner throughout, is 855 writes/s against about 1,300
-  in the scenarios where the fault moved ownership to node 1. The disk is one regional volume; presumably it is
-  closer to one zone. On vSAN the equivalent question is which site holds
-  the component the write waits for, and it should be measured there.
+  in the scenarios where the fault moved ownership to node 1. Run 9 then
+  measured the opposite way round (1.09 ms from node 0, 2.05 ms from
+  node 1), so the slow side is not a fixed property of a zone. What holds
+  is that in each run one node's writes cost about twice the other's, and
+  throughput follows whichever node owns the log. On vSAN the equivalent
+  question is which site holds the component the write waits for, and it
+  should be measured there.
 - At 128 clients duet matched etcd in this run (7,871 against 7,786),
   with the slow node as owner. Earlier runs had etcd ahead by a quarter.
   One run does not settle it.
 - The raw log (no etcd layer) took 12,578 writes/s from the slow node,
   against 26,000 in runs where the fast node owned it.
+
+## Run 9: state on the node's own disk, restart from it
+
+Binary at commit c0dcc45, which is before the fix to the order of the
+owner's check (b1adbf4). Same scenarios as run 8.
+
+| Fault | duet gap | etcd gap |
+|---|---|---|
+| None, 8 clients | 0.07 s (1,740 writes/s) | 0.02 s (1,299 writes/s) |
+| None, 128 clients | 0.08 s (8,668 writes/s) | 0.08 s (7,715 writes/s) |
+| Leader stopped on purpose | 0.45 s | 0.04 s |
+| Leader process killed | 2.74 s | 0.92 s |
+| Worst zone lost for 40 s | 2.44 s | 46.5 s |
+| Leader process frozen | 2.25 s | 2.01 s |
+| Leader VM suspended | 2.78 s | 3.03 s |
+| Leader VM reset | 2.38 s | 1.78 s |
+| Every member killed, started again 10 s later | 22.1 s | 27.9 s |
+
+- **The cold start is fixed.** With everything killed at once duet was
+  back in 22.1 s against etcd's 27.9 s; in run 8 it was 35.6 s against
+  27.0 s. Both nodes logged that they continued from their own state file
+  (at index 1,315,828 and 1,315,910, re-reading about 100,000 records of
+  log). Of six restarts in the run, five continued locally; the one after
+  the VM reset read a checkpoint back, because the other node had
+  written a newer checkpoint while it was down.
+- **Putting the state file on a real disk did not cost duet its
+  throughput.** That was the worry about runs 5 to 8. duet was ahead at 8
+  clients and at 128 here, with the faster side of the disk as owner in
+  the baseline. Given the 2x swing from which node owns the log, neither
+  system is shown to be faster.
+- **etcd is quicker when only the leader process dies** (0.9 s against
+  2.7 s) and on a planned stop in this run (0.04 s against 0.45 s). etcd's
+  planned stop has ranged from 0.04 s to 3.0 s across runs. duet's cost
+  for an unplanned loss is its lease, 2 s here, plus under a second.
+- **The zone result holds for a fifth run**: 2.4 s against 46.5 s.
+- The raw log took 25,343 writes/s with the fast side as owner.
