@@ -18,7 +18,7 @@ show. For results on real machines see [LAB-RUNS.md](LAB-RUNS.md) and
 | State machine: etcd's own storage, transaction and lease code driven by the log (`pkg/sm`) | Implemented |
 | etcd v3 gRPC API: KV, Watch, Lease, Maintenance Status (`pkg/api`, `duet run -etcd`) | Implemented for what kube-apiserver uses; passes the part of Kubernetes' own storage test suite listed in [test/kube](../test/kube/README.md); a real kube-apiserver (v1.37.2) ran against it through an owner kill with no acknowledged write lost. Nodes that do not own the log forward to the one that does; they do not serve reads themselves |
 | Checkpoints (`pkg/ckpt`) | Implemented: any node writes them, a restart loads the newest and replays the rest |
-| Log reuse (`pkg/trim`, `pkg/node`) | Implemented and tested in simulation, with mutation tests; not wired into the binary, where the log still fills up and stops |
+| Log reuse (`pkg/trim`, `pkg/node`, `duet retire`) | Implemented; tested in simulation with mutation tests and as processes over seven laps of a small log |
 | Epoch table reuse | Not planned; one slot per ownership change, sized at format time |
 | SCSI-3 reservation backend | Not started |
 | TLA+ model | Not started |

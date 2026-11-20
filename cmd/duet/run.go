@@ -73,17 +73,18 @@ type appendResp struct {
 }
 
 type status struct {
-	Checkpoint uint64 `json:"checkpoint"` // index of this node's last checkpoint
-	Restored   uint64 `json:"restored"`   // index of the checkpoint this node started from
-	Batches    uint64 `json:"batches"`    // log writes since start
-	Records    uint64 `json:"records"`    // records in those writes
-	AppendMs   uint64 `json:"append_ms"`  // time spent in them
-	ApplyMs    uint64 `json:"apply_ms"`   // spent applying to the state machine, on its own goroutine
-	Node       int    `json:"node"`
-	Owner      bool   `json:"owner"`
-	Epoch      uint64 `json:"epoch"`
-	Applied    uint64 `json:"applied"`
-	Chain      string `json:"chain"`
+	Checkpoint uint64  `json:"checkpoint"` // index of this node's last checkpoint
+	Restored   uint64  `json:"restored"`   // index of the checkpoint this node started from
+	Batches    uint64  `json:"batches"`    // log writes since start
+	Records    uint64  `json:"records"`    // records in those writes
+	AppendMs   uint64  `json:"append_ms"`  // time spent in them
+	Laps       float64 `json:"laps"`       // how many times round the log this node's position is
+	ApplyMs    uint64  `json:"apply_ms"`   // spent applying to the state machine, on its own goroutine
+	Node       int     `json:"node"`
+	Owner      bool    `json:"owner"`
+	Epoch      uint64  `json:"epoch"`
+	Applied    uint64  `json:"applied"`
+	Chain      string  `json:"chain"`
 }
 
 type server struct {
@@ -109,7 +110,12 @@ type server struct {
 	// etcd mode only.
 	dev           disk.Device
 	ckptEvery     uint64
-	ckptLast      uint64 // index at which the last checkpoint was started
+	ckptLast      uint64       // index at which the last checkpoint was started
+	ckptLastOff   int64        // and the log offset there
+	ckptPrevOff   atomic.Int64 // log offset of the last checkpoint known to be on disk
+	trimQ         chan int64   // offsets to publish as the head, for the loop
+	lapped        bool         // the log has been reused past this node's position
+	cursorOff     atomic.Int64
 	ckptBusy      atomic.Bool
 	ckptDone      atomic.Uint64
 	st            *sm.Store
@@ -174,6 +180,9 @@ func (s *server) publish() {
 	s.mu.Lock()
 	was := s.owner
 	s.owner, s.epoch, s.ownerNode = s.n.IsOwner(), s.n.Epoch(), s.n.Owner()
+	if c := s.n.Cursor(); c.Offset > 0 {
+		s.cursorOff.Store(c.Offset)
+	}
 	now := s.owner
 	s.mu.Unlock()
 	s.followOwnership(now)
@@ -194,12 +203,18 @@ func (s *server) maintain(campaign bool) {
 			log.Printf("node %d: renew: %v", s.id, err)
 		}
 	} else {
-		if err := s.n.Tail(); err != nil {
+		if err := s.n.Tail(); errors.Is(err, node.ErrLapped) {
+			s.lapped = true
+			return
+		} else if err != nil {
 			log.Printf("node %d: tail: %v", s.id, err)
 		}
 		if campaign && time.Now().After(s.backoff) {
 			err := s.n.Campaign()
 			switch {
+			case errors.Is(err, node.ErrLapped):
+				s.lapped = true
+				return
 			case err == nil, errors.Is(err, lease.ErrNotExpired):
 			case errors.Is(err, lease.ErrContended), errors.Is(err, lease.ErrLostBallot),
 				errors.Is(err, lease.ErrOwnerAlive), errors.Is(err, lease.ErrLeaseLost),
@@ -274,9 +289,25 @@ func (s *server) loop(ctx context.Context, tick time.Duration, campaign bool) {
 			return
 		case <-t.C:
 			s.maintain(campaign)
+			if s.lapped {
+				return
+			}
 			s.maybeCheckpoint()
 		case b := <-s.barriers:
 			s.barrier(b)
+		case off := <-s.trimQ:
+			// Free space only as it is needed: keep the last half lap of
+			// the log readable, so that a standby a little behind, or one
+			// that restarts, is not overtaken by the head.
+			if keep := s.n.Cursor().Offset - s.l.LogSize/2; off > keep {
+				off = keep
+			}
+			if off <= s.l.LogStart() {
+				continue
+			}
+			if err := s.n.Trim(off); err != nil {
+				log.Printf("node %d: publishing head %d: %v", s.id, off, err)
+			}
 		case r := <-s.reqs:
 			s.write(r)
 			for s.carry != nil {
@@ -334,6 +365,7 @@ func (s *server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	s.mu.RLock()
 	st := status{Node: s.id, Owner: s.owner, Epoch: s.epoch,
 		Checkpoint: s.ckptDone.Load(), Restored: s.base,
+		Laps:    float64(s.cursorOff.Load()-s.l.LogStart()) / float64(s.l.LogSize),
 		Batches: s.statBatches.Load(), Records: s.statRecords.Load(),
 		AppendMs: s.statAppendNs.Load() / 1e6, ApplyMs: s.statApplyNs.Load() / 1e6,
 		Applied: s.base + uint64(len(s.sums)), Chain: hex.EncodeToString(s.chain[:])}
@@ -394,6 +426,7 @@ func cmdRun(args []string) error {
 		s.applyQ, s.applyDone = make(chan applyTask, 1<<16), make(chan struct{})
 		go s.applier()
 		s.barriers = make(chan chan error, 8192)
+		s.trimQ = make(chan int64, 4)
 		s.watchProgress = *watchProgress
 	}
 	s.n, err = node.New(dev, realClock{time.Now()},
@@ -437,7 +470,14 @@ func cmdRun(args []string) error {
 	}
 	shutdown, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	return srv.Shutdown(shutdown)
+	srv.Shutdown(shutdown)
+	if s.lapped {
+		// Exit so that whatever supervises this process starts it again:
+		// a fresh start loads the newest checkpoint and, as a new
+		// incarnation, retires this one's old epochs.
+		return errors.New("the log has been reused past this node's position; restart to restore from a checkpoint")
+	}
+	return nil
 }
 
 func cmdDump(args []string) error {

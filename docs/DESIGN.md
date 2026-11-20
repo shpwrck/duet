@@ -161,7 +161,7 @@ A state larger than a checkpoint slot cannot be checkpointed; the node
 logs the failure and carries on. On Kubernetes-sized state the copy will
 compete with the log for disk throughput, and that has not been measured.
 
-## Trimming (in the library and the simulation; the binary does not trim yet)
+## Trimming
 
 The log has to be reused, or it fills. The plan is a circular log:
 positions stay as ever-growing logical offsets in epoch records, cursors
@@ -284,14 +284,30 @@ the reader's check, and so on) are each caught by at least one test. The
 random schedules do not inject late writes; that rule rests on the one
 directed test.
 
+**In the binary.** Each node publishes a head after its checkpoints,
+covering the log up to its previous checkpoint but never the last half lap,
+so a standby a little behind is not overtaken. A node that finds itself
+overtaken exits, so that its supervisor starts it again from a checkpoint.
+A starting node uses only a checkpoint at or beyond the head, and waits
+for one if the only good one is being replaced. `duet retire` declares a
+node gone for good. A process test takes an 8 MiB log round more than
+seven times through the etcd API: across an owner kill and restart, past a
+standby frozen until it is overtaken, and past an owner that dies for
+good, where the log fills after one more lap and continues once the node
+is retired.
+
+That test found two faults in the first wiring. Publishing the head at the
+previous checkpoint overtook a healthy standby under load, hence the half
+lap. And abandoning a checkpoint (the state was too large for its slot)
+crashed the node, which is fixed and has its own test.
+
 **Not done.**
 
-- The binary never publishes a head, so in practice the log still fills
-  and stops. Wiring it in means: publish after a checkpoint, exit on
-  `ErrLapped` so the supervisor restarts the node, and a `retire` command.
-- A reader that must restart while the only checkpoint at or beyond the
-  head is being replaced has to wait for the new one.
-- The vCenter-confirmed retire controller does not exist.
+- The controller that asks vCenter and then runs the retire step does not
+  exist.
+- Checkpoint slots have a fixed size. A state that outgrows them stops
+  checkpoints, and with them log reuse; the node reports it and carries on
+  until the log is full.
 
 ## Decisions made
 

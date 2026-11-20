@@ -32,6 +32,8 @@ func main() {
 		err = cmdLoad(os.Args[2:])
 	case "verify":
 		err = cmdVerify(os.Args[2:])
+	case "retire":
+		err = cmdRetire(os.Args[2:])
 	case "diskprobe":
 		err = cmdDiskProbe(os.Args[2:])
 	case "etcdload":

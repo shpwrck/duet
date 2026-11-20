@@ -83,7 +83,7 @@ func (c *cluster) endpoints() string {
 
 // setup builds the binary and formats a shared image for three nodes with
 // a one-second lease.
-func setup(t *testing.T) (*cluster, string) {
+func setup(t *testing.T, formatArgs ...string) (*cluster, string) {
 	t.Helper()
 	dir := t.TempDir()
 	c := &cluster{t: t, bin: filepath.Join(dir, "duet"), device: filepath.Join(dir, "disk.img"), direct: "-direct=true"}
@@ -97,8 +97,9 @@ func setup(t *testing.T) (*cluster, string) {
 		t.Fatal(err)
 	}
 	format := func() ([]byte, error) {
-		return exec.Command(c.bin, "format", "-device", c.device, "-nodes", "3", "-ttl", "1s",
-			"-epoch-slots", "256", "-max-batch", "262144", "-checkpoint-size", "16777216", c.direct).CombinedOutput()
+		args := []string{"format", "-device", c.device, "-nodes", "3", "-ttl", "1s",
+			"-epoch-slots", "256", "-max-batch", "262144", "-checkpoint-size", "16777216", c.direct}
+		return exec.Command(c.bin, append(args, formatArgs...)...).CombinedOutput()
 	}
 	if out, err := format(); err != nil {
 		t.Logf("direct I/O unavailable, falling back to buffered: %s", out)

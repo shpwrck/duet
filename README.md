@@ -105,8 +105,8 @@ Not shown:
 - **Independence from the disk's speed.** duet's latency is the shared
   disk's latency as seen from the writer. In one run that was twice as slow
   from one node.
-- **Long runs.** Log space is reclaimed in simulation only; the binary's
-  log fills and stops.
+- **Long runs.** Log space is reclaimed and reused, tested over seven laps
+  of a small log, but nothing has run for more than a few minutes.
 - **Scale.** Tested to 6,000 simulated pods on one machine.
 
 [docs/STATUS.md](docs/STATUS.md) lists every component and how it was
