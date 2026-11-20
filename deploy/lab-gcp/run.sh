@@ -29,9 +29,17 @@ ZONE[2]="$(jq -r '.third.value.zone' <<<"$tf")"
 IP[2]="$(jq -r '.third.value.ip' <<<"$tf")"
 
 rsh() { # rsh NAME ZONE COMMAND...
-  local name=$1 zone=$2
+  local name=$1 zone=$2 rc=0
   shift 2
-  gcloud compute ssh "$name" --zone "$zone" "${SSH[@]}" --command "$*"
+  # SSH through the tunnel fails now and then for reasons that have nothing
+  # to do with the command (exit 255). Retry those, and only those.
+  for _ in 1 2 3; do
+    rc=0
+    gcloud compute ssh "$name" --zone "$zone" "${SSH[@]}" --command "$*" || rc=$?
+    [ "$rc" = 255 ] || return "$rc"
+    sleep 5
+  done
+  return "$rc"
 }
 node() { rsh "${NAME[$1]}" "${ZONE[$1]}" "${@:2}"; }
 client() { rsh "$CLIENT" "$CZONE" "$@"; }
