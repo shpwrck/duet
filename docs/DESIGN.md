@@ -156,13 +156,74 @@ loads the newest intact checkpoint and replays only the log after it.
   the state and the log position describe the same moment. The copy to
   disk runs in the background from a database snapshot.
 
-Not done yet: **the log is still never trimmed.** Checkpoints make
-trimming possible (records at or below the oldest checkpoint a node could
-need are dead) but the log is a linear region with no wrap-around, and
-the epoch table has no reuse. A state larger than a checkpoint slot
-cannot be checkpointed; the node logs the failure and carries on. On
-Kubernetes-sized state the copy will compete with the log for disk
-throughput, and that has not been measured.
+A state larger than a checkpoint slot cannot be checkpointed; the node
+logs the failure and carries on. On Kubernetes-sized state the copy will
+compete with the log for disk throughput, and that has not been measured.
+
+## Trimming (design; not implemented)
+
+The log has to be reused, or it fills. The plan is a circular log:
+positions stay as ever-growing logical offsets in epoch records, cursors
+and checkpoints, and map to the disk modulo the log size. Reuse creates
+two hazards that the linear log does not have.
+
+**Hazard 1: a slow reader is overtaken.** The writer overwrites records a
+lagging or restarting node has not read yet.
+
+- A node publishes a *head* in its own lease block: a logical offset with
+  the promise that a durable checkpoint exists at or beyond it. Heads only
+  grow. The effective head is the largest one in any lease block.
+- The writer may overwrite a position only after publishing a head beyond
+  it, in that order.
+- A reader reads records first and the heads second. If the head has
+  passed the point it read from, it throws the records away and restarts
+  from a checkpoint at or beyond the head. This is the same read-then-look
+  order that already protects readers from a takeover.
+- Stale data from the previous lap can never be mistaken for current
+  data: a record is accepted only with the exact epoch and index expected
+  at its position, and indexes never repeat.
+
+**Hazard 2: a deposed writer's late write lands on live data.** Today a
+deposed owner can still issue one write, and it is harmless because it
+lands in a gap after its epoch's cutoff that nobody ever reads or reuses.
+In a circular log that gap is reused one lap later. A node that was
+suspended just before the write, for longer than a lap takes, would wake
+up and destroy acknowledged records. No timeout can rule this out, for
+the reason found in lab run 3: a suspended node's clock stops.
+
+- The rule: the gap after epoch E's cutoff may not be reused until the
+  owner of E is known to have stopped writing for E. The evidence is in
+  that node's own lease block: it shows a newer incarnation (the process
+  restarted), a newer epoch, or a mark the node writes when it learns it
+  was deposed. A node is one loop, so once it has written that mark its
+  earlier write has returned.
+- The writer therefore stops at `min(head, cutoff of the oldest epoch
+  whose owner has not retired) + log size`. If it cannot advance, writes
+  fail with "log full", as today.
+
+**The consequence that needs a decision.** If a deposed owner never comes
+back (host destroyed), nothing on the disk can prove it will not write
+again, and the log cannot wrap past its gap. Someone or something has to
+declare the node dead: an operator command, or a fencing mechanism. This
+is the one place where the "no fencing" position costs something, and it
+is where SCSI-3 reservations or a VCF-side power-state check would earn
+their place. Until the node is declared dead the cluster keeps running on
+the remaining log space; it does not lose data.
+
+**Epoch table.** It stays finite. Reusing slots has the same late-writer
+hazard for ballot participants and is deferred. One slot is used per
+ownership change, so the limit is the number of failovers over the life
+of the disk: 65,536 slots cost 256 MiB.
+
+**Open points before coding.**
+
+- A reader that must restart from a checkpoint while the only checkpoint
+  at or beyond the head is being replaced has to wait for the new one.
+- The head must be re-read by a restarting node from all lease blocks
+  before it writes its own, or heads could go backwards.
+- This changes rules that the simulation and the mutation tests cover.
+  It gets implemented in the simulation first, with wrap-around in the
+  random schedules, before the binary uses it.
 
 ## Decisions made
 
