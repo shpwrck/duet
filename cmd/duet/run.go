@@ -110,6 +110,7 @@ type server struct {
 	// etcd mode only.
 	dev           disk.Device
 	ckptEvery     uint64
+	quota         int64
 	ckptLast      uint64       // index at which the last checkpoint was started
 	ckptLastOff   int64        // and the log offset there
 	ckptPrevOff   atomic.Int64 // log offset of the last checkpoint known to be on disk
@@ -399,6 +400,7 @@ func cmdRun(args []string) error {
 	etcdListen := fs.String("etcd", "", "address for the etcd v3 gRPC API; empty leaves it off and the log carries opaque payloads")
 	etcdPeers := fs.String("etcd-peers", "", "comma-separated etcd API addresses of all nodes, in node id order; lets a node that does not own the log forward calls to the one that does")
 	stateDir := fs.String("state-dir", "", "directory for the etcd state machine's files (rebuilt from the log at every start); default is the system temporary directory")
+	quota := fs.Int64("state-quota", 0, "refuse new data once the etcd state file reaches this many bytes; 0 means nine tenths of a checkpoint slot; negative means no limit")
 	ckptEvery := fs.Uint64("checkpoint-every", 100000, "write a checkpoint of the etcd state after this many records; 0 never. Needs a disk formatted with -checkpoint-size")
 	watchProgress := fs.Duration("watch-progress-interval", 10*time.Minute, "how often idle watchers that asked for progress notifications get one (etcd's --watch-progress-notify-interval; kubeadm sets 5s)")
 	startDelay := fs.Duration("start-delay", time.Second, "wait before first touching the disk, so a previous process's last write has landed")
@@ -418,7 +420,7 @@ func cmdRun(args []string) error {
 	s := &server{id: *id, l: l, ownerNode: -1, reqs: make(chan *appendReq, 8192)}
 	var cursor node.Cursor
 	if *etcdListen != "" {
-		s.dev, s.ckptEvery = dev, *ckptEvery
+		s.dev, s.ckptEvery, s.quota = dev, *ckptEvery, *quota
 		if cursor, err = s.restore(*stateDir); err != nil {
 			return err
 		}

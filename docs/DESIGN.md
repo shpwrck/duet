@@ -157,9 +157,22 @@ loads the newest intact checkpoint and replays only the log after it.
   the state and the log position describe the same moment. The copy to
   disk runs in the background from a database snapshot.
 
-A state larger than a checkpoint slot cannot be checkpointed; the node
-logs the failure and carries on. On Kubernetes-sized state the copy will
-compete with the log for disk throughput, and that has not been measured.
+A state larger than a checkpoint slot cannot be checkpointed, and a state
+that cannot be checkpointed means the log is never reused: it fills, and
+then nothing can be written and no node can even be elected. A soak run
+hit exactly this. So the owner refuses new data once the state file
+reaches nine tenths of a slot (`-state-quota` overrides it), with the
+error etcd gives at its own size limit, "database space exceeded", which
+kube-apiserver already understands. Deletes, compactions, reads and
+checkpoints carry on. As with etcd, the file does not shrink by itself
+after deletes; freed pages are reused, and duet has no defragment call
+yet, so the slot has to be sized for the largest state the cluster will
+hold.
+
+With 240 to 740 MiB of state a checkpoint takes 1.4 to 3.0 s on a local
+disk and the longest stall in writes while it runs was 57 ms
+([measurements](../test/kube/README.md#a-larger-state)). Multi-gigabyte
+state has not been measured.
 
 ## Trimming
 

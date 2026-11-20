@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/shpwrck/duet/pkg/api"
+	"github.com/shpwrck/duet/pkg/disk"
 	"github.com/shpwrck/duet/pkg/node"
 	"github.com/shpwrck/duet/pkg/sm"
 	"github.com/shpwrck/duet/pkg/wal"
@@ -127,6 +128,14 @@ func (s *server) startEtcd(addr string, peers []string) error {
 	real := grpc.NewServer()
 	b, member := etcdBackend{s}, uint64(s.id+1)
 	kv := api.NewKV(b, 1, member)
+	switch {
+	case s.quota > 0:
+		kv.Quota = s.quota
+	case s.quota == 0 && s.l.CkptSize > 0:
+		// Stop taking new data while the state still fits a checkpoint
+		// slot with room to spare. See api.KV.Quota.
+		kv.Quota = (s.l.CkptSize - disk.BlockSize) / 10 * 9
+	}
 	pb.RegisterKVServer(real, kv)
 	watch := api.NewWatch(b, 1, member)
 	watch.Progress = s.watchProgress

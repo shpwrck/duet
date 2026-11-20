@@ -293,7 +293,7 @@ func TestCheckpointTooLargeIsSurvived(t *testing.T) {
 	c, _ := setup(t, "-checkpoint-size", "65536")
 	eps := []string{freeAddr(t), freeAddr(t)}
 	for i := 0; i < 2; i++ {
-		c.nodes = append(c.nodes, c.start(i, freeAddr(t), "-etcd", eps[i], "-etcd-peers", strings.Join(eps, ","), "-state-dir", t.TempDir(), "-checkpoint-every", "100"))
+		c.nodes = append(c.nodes, c.start(i, freeAddr(t), "-etcd", eps[i], "-etcd-peers", strings.Join(eps, ","), "-state-dir", t.TempDir(), "-checkpoint-every", "100", "-state-quota", "-1"))
 	}
 	defer func() {
 		for _, p := range c.nodes {
@@ -326,4 +326,74 @@ func TestCheckpointTooLargeIsSurvived(t *testing.T) {
 			t.Fatalf("node %d: %+v", p.id, st)
 		}
 	}
+}
+
+// The state must never outgrow a checkpoint slot: without a checkpoint the
+// log cannot be reused, and once it is full nothing can be written or even
+// elected. So new data is refused first, with the error etcd gives when its
+// own size limit is reached, while deletes, reads and checkpoints carry on.
+func TestQuotaKeepsStateCheckpointable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts real processes; skipped with -short")
+	}
+	c, _ := setup(t, "-checkpoint-size", "4194304")
+	eps := []string{freeAddr(t), freeAddr(t)}
+	for i := 0; i < 2; i++ {
+		c.nodes = append(c.nodes, c.start(i, freeAddr(t), "-etcd", eps[i], "-etcd-peers", strings.Join(eps, ","), "-state-dir", t.TempDir(), "-checkpoint-every", "200"))
+	}
+	defer func() {
+		for _, p := range c.nodes {
+			p.cmd.Process.Kill()
+			p.cmd.Wait()
+		}
+	}()
+	c.owner()
+	cli, err := clientv3.New(clientv3.Config{Endpoints: eps, DialTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	value := strings.Repeat("v", 2048)
+	refused := -1
+	for i := 0; i < 20000; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := cli.Put(ctx, fmt.Sprintf("/q/%05d", i), value)
+		cancel()
+		if err != nil {
+			if !strings.Contains(err.Error(), "database space exceeded") {
+				t.Fatalf("put %d: %v", i, err)
+			}
+			refused = i
+			break
+		}
+	}
+	if refused < 100 {
+		t.Fatalf("writes were refused at %d", refused)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// A transaction that adds data is refused too; one that only deletes is not.
+	if _, err := cli.Txn(ctx).Then(clientv3.OpPut("/q/x", value)).Commit(); err == nil || !strings.Contains(err.Error(), "database space exceeded") {
+		t.Fatalf("txn with a put: %v", err)
+	}
+	if _, err := cli.Txn(ctx).Then(clientv3.OpDelete("/q/00001")).Commit(); err != nil {
+		t.Fatalf("txn with only a delete: %v", err)
+	}
+	if d, err := cli.Delete(ctx, "/q/00000"); err != nil || d.Deleted != 1 {
+		t.Fatalf("delete: %v %v", d, err)
+	}
+	if g, err := cli.Get(ctx, "/q/", clientv3.WithPrefix(), clientv3.WithCountOnly()); err != nil || g.Count != int64(refused-2) {
+		t.Fatalf("count: %v %v, want %d", g, err, refused-2)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	for _, p := range c.nodes {
+		st, err := p.status()
+		if err != nil {
+			t.Fatalf("node %d is gone: %v", p.id, err)
+		}
+		if st.Checkpoint == 0 || st.Applied < uint64(refused) {
+			t.Fatalf("node %d did not checkpoint the full state: %+v", p.id, st)
+		}
+	}
+	t.Logf("new data refused after %d objects of 2 KiB with a 4 MiB slot; deletes, reads and checkpoints continued", refused)
 }

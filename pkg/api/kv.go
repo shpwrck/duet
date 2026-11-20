@@ -48,6 +48,29 @@ type KV struct {
 	lg        *zap.Logger
 	clusterID uint64
 	memberID  uint64
+
+	// Quota, when positive, is the size of the state file past which
+	// writes that add data are refused with etcd's "database space
+	// exceeded". Deletes and compactions are still accepted. It keeps
+	// the state small enough to checkpoint; a state that cannot be
+	// checkpointed means the log can never be reused.
+	Quota int64
+}
+
+func (s *KV) full() bool { return s.Quota > 0 && s.b.Store().DbSize() >= s.Quota }
+
+func txnPuts(r *pb.TxnRequest) bool {
+	for _, ops := range [][]*pb.RequestOp{r.Success, r.Failure} {
+		for _, op := range ops {
+			if op.GetRequestPut() != nil {
+				return true
+			}
+			if t := op.GetRequestTxn(); t != nil && txnPuts(t) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func NewKV(b Backend, clusterID, memberID uint64) *KV {
@@ -143,6 +166,9 @@ func (s *KV) Put(ctx context.Context, r *pb.PutRequest) (*pb.PutResponse, error)
 	if len(r.Key) == 0 {
 		return nil, rpctypes.ErrGRPCEmptyKey
 	}
+	if s.full() {
+		return nil, rpctypes.ErrGRPCNoSpace
+	}
 	res, err := s.propose(ctx, &sm.Command{Put: r})
 	if err != nil {
 		return nil, err
@@ -169,6 +195,9 @@ func (s *KV) DeleteRange(ctx context.Context, r *pb.DeleteRangeRequest) (*pb.Del
 // That is correct but slower than it needs to be for read-only
 // transactions; kube-apiserver does not issue those.
 func (s *KV) Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, error) {
+	if s.full() && txnPuts(r) {
+		return nil, rpctypes.ErrGRPCNoSpace
+	}
 	res, err := s.propose(ctx, &sm.Command{Txn: r})
 	if err != nil {
 		return nil, err
