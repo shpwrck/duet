@@ -41,7 +41,10 @@ An epoch table entry says who owns the epoch, the index and offset of its
 first record, and the cutoff: the offset where the previous epoch's valid
 records end.
 
-Log records are `{epoch, index, length, crc, payload}`. A reader accepts a
+Log records are `{epoch, index, length, crc, payload}`. Each batch is one
+write that starts on a 4096-byte boundary and is padded to a whole number
+of blocks, so every write is block aligned (direct I/O requires it) and no
+two writers ever touch the same block. A reader accepts a
 record only if it has the epoch and index expected at that position.
 
 ## Protocol
@@ -75,8 +78,8 @@ nothing new.
 **Rule 6, check after write.** The owner acknowledges a batch only if the
 lease is still valid after the batch was flushed.
 
-**Rule 7, gap between epochs.** A new epoch starts one maximum batch past
-the cutoff. A writer has at most one batch in flight, and it lands within
+**Rule 7, gap between epochs.** A new epoch starts on the block boundary
+one maximum batch past the cutoff. A writer has at most one batch in flight, and it lands within
 one batch of the cutoff, so a deposed writer's last write cannot touch the
 new epoch.
 
@@ -177,5 +180,6 @@ GKE or EKS scale needs a load test at that scale.
 | 5 | Kubernetes demo on the lab and on vSAN | Conformance; recovery benchmark against milestone 1 |
 | 6 | Scale: partitions, in-memory state, load tests against the targets above | Measured throughput per partition; gap to targets stated |
 
-Until a vSAN lab exists, milestones 0 and 1 run on the stand-ins in
-[LAB.md](LAB.md), and their results are labelled as such.
+Until a vSAN lab exists, milestones 0 and 1 run on the Google Cloud
+stand-in described in [LAB.md](LAB.md), and their results are labelled as
+such.

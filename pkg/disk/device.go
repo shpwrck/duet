@@ -14,9 +14,7 @@
 package disk
 
 import (
-	"errors"
 	"io"
-	"os"
 	"sync"
 )
 
@@ -61,38 +59,3 @@ func (d *MemDevice) WriteAt(p []byte, off int64) (int, error) {
 
 func (d *MemDevice) Sync() error { return nil }
 func (d *MemDevice) Size() int64 { return int64(len(d.buf)) }
-
-// FileDevice is a Device backed by a file or a raw block device.
-//
-// It does not yet open with O_DIRECT. Until it does, a standby reading a
-// disk shared between machines may see stale page-cache contents, so
-// FileDevice is only correct today when every node is a process on the
-// same kernel. Direct I/O is tracked in docs/DESIGN.md.
-type FileDevice struct {
-	f    *os.File
-	size int64
-}
-
-// OpenFile opens path, which must already exist and be at least size bytes.
-func OpenFile(path string, size int64) (*FileDevice, error) {
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		return nil, err
-	}
-	end, err := f.Seek(0, io.SeekEnd)
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	if end < size {
-		f.Close()
-		return nil, errors.New("disk: device smaller than requested size")
-	}
-	return &FileDevice{f: f, size: size}, nil
-}
-
-func (d *FileDevice) ReadAt(p []byte, off int64) (int, error)  { return d.f.ReadAt(p, off) }
-func (d *FileDevice) WriteAt(p []byte, off int64) (int, error) { return d.f.WriteAt(p, off) }
-func (d *FileDevice) Sync() error                              { return d.f.Sync() }
-func (d *FileDevice) Size() int64                              { return d.size }
-func (d *FileDevice) Close() error                             { return d.f.Close() }

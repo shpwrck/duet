@@ -1,0 +1,9 @@
+/duet
+/deploy/lab-gcp/duet
+*.img
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate*
+/deploy/lab-gcp/results.json
+/deploy/lab-gcp/summary.md
+gha-creds-*.json

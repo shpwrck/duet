@@ -1,32 +1,64 @@
-# Lab stand-ins
+# Labs
 
-Until a two-host vSAN cluster is available, open-source pieces stand in for
-it. Results from these are labelled as stand-in results; they say nothing
-about vSAN.
+Three places the protocol runs, in increasing order of realism. None of
+them is vSAN; results from each are labelled with where they came from.
 
-**Nothing on this page has been built or run yet.** It is the plan.
+| Lab | What it is | Status |
+| --- | --- | --- |
+| Simulation (`pkg/node`) | All nodes in one process on an ideal in-memory disk, interleaved at single block operations | Runs in CI |
+| Processes (`test/proc`) | Real `duet` processes with direct I/O, a real clock and signals, on one disk image and one kernel | Runs locally |
+| Google Cloud (`deploy/lab-gcp`) | Two nodes in two zones on one regionally replicated multi-writer disk | Written, **not yet run** |
+
+## Google Cloud lab
 
 | vSAN piece | Stand-in | Faithful in | Not faithful in |
 | --- | --- | --- | --- |
-| Multi-writer VMDK shared by two VMs | One raw disk image attached to two KVM guests as shareable, with host caching off | Two kernels, no shared page cache, real block I/O | One host, so no replication, no partition between hosts, different latency |
-| Clustered VMDK with SCSI-3 reservations | A Linux LIO iSCSI target exporting one LUN to both guests | Real persistent reservations, including preempt-and-abort | The target is a third machine in the lab; in production its role is vSAN's |
-| vSAN partition handling | Blocking one guest's access to the disk | The losing side loses I/O | vSAN also stops the VMs; here that is scripted |
-| Host failure | Killing a guest | Process and kernel death | No storage rebuild |
-| VM stun | Pausing a guest for longer than the lease | The pause case exactly | |
+| Multi-writer VMDK mirrored across two hosts | Hyperdisk Balanced High Availability in multi-writer mode, replicated across two zones | Two kernels, no shared page cache, synchronously replicated network block storage, two failure domains | Different storage system with its own semantics and latency |
+| vSAN witness | Google's own regional disk control plane | The tiebreak lives in the storage layer, not in duet | Not visible or testable |
+| Host failure | Stopping the owner's VM | The node and its zone attachment disappear | No storage rebuild to observe |
+| VM stun | Freezing the process for four lease periods | The pause case exactly | Not a hypervisor-level stun |
+| Clustered VMDK reservations | NVMe persistent reservations on the same disk | Register, acquire, release | Google does not support preempt-and-abort, so the reservation backend must manage with preempt alone or acquire after release |
 
-## Order of work
+Scenarios run by `run.sh`: baseline, throughput (128 writers), planned
+handover, owner frozen, owner killed, owner's VM stopped. Each records
+acknowledged writes, throughput, latency, the longest stretch with no
+acknowledged write, and whether every node agrees and no acknowledged
+write is missing.
 
-1. `duetd` able to run the existing protocol against a real block device
-   with direct I/O and a real clock.
-2. Two KVM guests on a shared raw disk: repeat the simulation's scenarios
-   with real processes (pause, kill, slow I/O).
-3. Baseline on the same two guests: stock etcd under Pacemaker with
-   disk-based fencing. Measure recovery time. This is the milestone 1 gate.
-4. iSCSI target: the reservation backend, and stock etcd with reservation
-   fencing as a second baseline.
+### Running it
+
+One-time, by the project owner, in Cloud Shell:
+
+```
+git clone https://github.com/shpwrck/duet && cd duet/deploy/lab-gcp
+./setup.sh YOUR_PROJECT_ID
+```
+
+Set the three values it prints as repository variables. Then start the
+`lab-gcp` workflow from the Actions tab and type the confirmation phrase.
+The workflow builds, creates the lab, runs the scenarios, uploads
+`results.json` and destroys everything, including when a step fails.
+
+### What it creates and what it costs
+
+- Three `n4-standard-2` VMs (two nodes, one client), no public addresses.
+- One 20 GB regional Hyperdisk Balanced High Availability volume.
+- Three 10 GB boot disks, one network, one subnet, two firewall rules.
+
+A run takes well under an hour. The VMs list at about $0.09 an hour each
+in us-central1 (third-party price trackers, November 2026); disk charges at
+this size and duration have not been priced but are small next to that.
+Budget alerts in Google Cloud warn and do not cap, so the safeguards are:
+teardown always runs, the VMs delete themselves after two hours, and the
+workflow fails loudly if any labelled resource is left.
+
+### Still on a KVM host or iSCSI target
+
+Stock etcd under Pacemaker with disk-based fencing (the milestone 1
+baseline) can run on the same Google Cloud lab and is the next addition.
 
 ## What only vSAN can answer
 
-Everything in the "To verify" table of [VCF-GAPS.md](VCF-GAPS.md). The
-stand-ins exercise the protocol; they cannot confirm the assumptions the
-protocol makes about the disk.
+Everything in the "To verify" table of [VCF-GAPS.md](VCF-GAPS.md). These
+labs exercise the protocol; they cannot confirm what the protocol assumes
+about a vSAN disk.

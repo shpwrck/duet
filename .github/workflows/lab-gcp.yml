@@ -1,0 +1,89 @@
+# Creates the Google Cloud lab, runs the fault scenarios, saves the results
+# and tears everything down. Starts only by hand, and only with the
+# confirmation phrase, because it creates billable resources.
+name: lab-gcp
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "create billable resources" to run'
+        required: true
+      ttl:
+        description: Lease length
+        default: 5s
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: lab-gcp
+  cancel-in-progress: false
+
+jobs:
+  lab:
+    if: inputs.confirm == 'create billable resources'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      TF_VAR_project: ${{ vars.GCP_PROJECT }}
+      TF_IN_AUTOMATION: "true"
+      DUET_TTL: ${{ inputs.ttl }}
+    defaults:
+      run:
+        working-directory: deploy/lab-gcp
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o duet ../../cmd/duet
+
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Create lab
+        run: terraform init -input=false && terraform apply -input=false -auto-approve
+
+      - name: Run scenarios
+        run: ./run.sh
+
+      - name: Summary
+        if: always()
+        run: test -f summary.md && cat summary.md >> "$GITHUB_STEP_SUMMARY" || echo "no summary produced" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lab-gcp-results
+          path: |
+            deploy/lab-gcp/results.json
+            deploy/lab-gcp/summary.md
+          if-no-files-found: ignore
+
+      - name: Tear down
+        if: always()
+        run: terraform destroy -input=false -auto-approve
+
+      - name: Check nothing is left
+        if: always()
+        run: |
+          left="$(gcloud compute instances list --project "$TF_VAR_project" --filter='labels.lab=duet-lab' --format='value(name)')"
+          disks="$(gcloud compute disks list --project "$TF_VAR_project" --filter='labels.lab=duet-lab' --format='value(name)')"
+          if [ -n "$left$disks" ]; then
+            echo "::error::lab resources still exist: $left $disks"
+            exit 1
+          fi

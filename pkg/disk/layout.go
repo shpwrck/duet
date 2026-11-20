@@ -43,8 +43,8 @@ func (l Layout) Validate() error {
 		return errors.New("disk: EpochSlots must be positive")
 	case l.TTL <= 0:
 		return errors.New("disk: TTL must be positive")
-	case l.MaxBatch < 64:
-		return errors.New("disk: MaxBatch too small")
+	case l.MaxBatch < BlockSize || l.MaxBatch%BlockSize != 0:
+		return errors.New("disk: MaxBatch must be a positive multiple of BlockSize")
 	case l.LogSize < int64(4*l.MaxBatch):
 		return errors.New("disk: LogSize must hold at least four batches")
 	}
@@ -59,6 +59,12 @@ func (l Layout) SlotOff(epoch uint64) int64 {
 func (l Layout) LogStart() int64 { return BlockSize * int64(1+2*l.Nodes+l.EpochSlots) }
 func (l Layout) LogEnd() int64   { return l.LogStart() + l.LogSize }
 func (l Layout) Total() int64    { return l.LogEnd() }
+
+// AlignUp rounds n up to the next multiple of BlockSize. Log batches start
+// and end on block boundaries so that every write is a whole number of
+// blocks, which direct I/O requires and which keeps one writer's blocks
+// from overlapping another's.
+func AlignUp(n int64) int64 { return (n + BlockSize - 1) &^ (BlockSize - 1) }
 
 // WriteBlock writes payload as one checksummed metadata block and syncs.
 func WriteBlock(dev Device, off int64, payload []byte) error {

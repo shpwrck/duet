@@ -92,7 +92,7 @@ type simNode struct {
 
 func newWorld(t *testing.T, nodes int) *world {
 	t.Helper()
-	lay := disk.Layout{Nodes: nodes, EpochSlots: 600, LogSize: 2 << 20, TTL: simTTL, MaxBatch: 512}
+	lay := disk.Layout{Nodes: nodes, EpochSlots: 600, LogSize: 8 << 20, TTL: simTTL, MaxBatch: disk.BlockSize}
 	w := &world{t: t, disk: disk.NewMemDevice(lay.Total()), lay: lay,
 		history: map[uint64]string{}, acked: map[uint64]string{}}
 	if err := disk.Format(w.disk, lay); err != nil {

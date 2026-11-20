@@ -13,8 +13,9 @@ The idea is the one Amazon EKS uses at 100,000 nodes: take Raft out, keep a
 single writer, and push durability and ordering into a replicated log. Here
 the log is a shared disk.
 
-**Status: early.** The ownership protocol and the log exist and are tested
-in simulation. There is no etcd API yet, and nothing has run on vSAN. See
+**Status: early.** The ownership protocol and the log exist, tested in
+simulation and as real processes on one machine. There is no etcd API yet,
+and nothing has run on vSAN. See
 [what exists](#what-exists-today) before drawing conclusions.
 
 ## How it works
@@ -43,18 +44,20 @@ safety argument.
 | Disk Paxos ownership and leases (`pkg/lease`) | Implemented |
 | Writer, tailer, takeover (`pkg/node`) | Implemented |
 | Fault simulation and tests | Implemented, see below |
+| `duet` process: direct I/O, real clock, renewal loop, group commit (`cmd/duet`) | Implemented, with a temporary HTTP interface for testing |
+| Process-level fault test (`test/proc`) | Implemented: owner frozen and killed under load |
 | etcd gRPC API, state machine | Not started |
 | Checkpoints and log trimming | Not started |
-| Daemon, direct I/O, real clocks | Not started |
 | SCSI-3 reservation backend | Not started |
 | TLA+ model | Not started |
-| Lab environments | Described in [docs/LAB.md](docs/LAB.md), not built |
+| Google Cloud lab (`deploy/lab-gcp`) | Written and schema-validated, not yet run |
 | Anything on vSAN | Not started; needs a lab |
 
 ## Tests
 
 ```
-go test ./...                    # about two seconds
+go test -short ./...             # simulation only, a few seconds
+go test ./...                    # adds real processes, about 20 seconds
 DUET_SEEDS=6000 go test ./pkg/node -run TestRandomSchedules -v   # soak
 ```
 
@@ -72,6 +75,11 @@ What that does and does not show:
   ten; the randomised test alone catches eight of ten at 4,000 seeds.
 - A 6,000-schedule run passed with about 69,000 acknowledged writes and
   55,000 ownership changes.
+- As real processes on one machine (three nodes, 1 s lease, direct I/O on a
+  local disk), a frozen owner and a killed owner were each replaced in under
+  two seconds, with every acknowledged write present on all nodes afterwards.
+  Throughput there was about 7,000 writes per second from 8 clients. That
+  is a local SSD and one kernel; it says nothing about shared network disks.
 - The simulated disk is ideal: linearizable, atomic block writes, durable on
   return. Whether a vSAN multi-writer disk behaves that way is unverified
   and is the first thing to test on real hardware.
@@ -83,7 +91,7 @@ What that does and does not show:
 - [docs/DESIGN.md](docs/DESIGN.md): protocol, assumptions, scaling path, milestones
 - [docs/PRIOR-ART.md](docs/PRIOR-ART.md): Kine, GKE on Spanner, EKS on Journal and others, and what each lacks here
 - [docs/VCF-GAPS.md](docs/VCF-GAPS.md): what is unverified or missing in VCF for this to ship
-- [docs/LAB.md](docs/LAB.md): open-source stand-ins for vSAN until a real lab is available
+- [docs/LAB.md](docs/LAB.md): the three labs, including the Google Cloud stand-in for vSAN
 
 ## License
 

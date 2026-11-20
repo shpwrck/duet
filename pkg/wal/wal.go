@@ -55,53 +55,106 @@ func encode(dst []byte, epoch, index uint64, payload []byte) []byte {
 	return dst
 }
 
+// window is a read-ahead buffer over the log, so that a scan costs one
+// device read per chunk instead of two per record.
+type window struct {
+	dev   disk.Device
+	l     disk.Layout
+	start int64
+	buf   []byte
+	next  int64 // size of the next chunk; grows as a scan keeps going
+}
+
+const (
+	windowMin = 16 << 10
+	windowMax = 1 << 20
+)
+
+// bytes returns n bytes at off, or nil if that range is outside the log.
+func (w *window) bytes(off int64, n int) ([]byte, error) {
+	if off < w.l.LogStart() || off+int64(n) > w.l.LogEnd() {
+		return nil, nil
+	}
+	if off < w.start || off+int64(n) > w.start+int64(len(w.buf)) {
+		start := off &^ (disk.BlockSize - 1)
+		size := disk.AlignUp(off + int64(n) - start)
+		if w.next < windowMin {
+			w.next = windowMin
+		}
+		if size < w.next {
+			size = w.next
+		}
+		if w.next < windowMax {
+			w.next *= 2 // a short scan stays cheap, a long replay reads big chunks
+		}
+		if start+size > w.l.LogEnd() {
+			size = w.l.LogEnd() - start
+		}
+		buf := make([]byte, size)
+		if _, err := w.dev.ReadAt(buf, start); err != nil {
+			return nil, err
+		}
+		w.start, w.buf = start, buf
+	}
+	return w.buf[off-w.start : off-w.start+int64(n)], nil
+}
+
 // readRecord returns the record at off if it is a valid record with exactly
 // this epoch and index. Anything else, including zeroes, a torn write, or a
 // record from another epoch, reports ok=false.
-func readRecord(dev disk.Device, l disk.Layout, off int64, epoch, index uint64) (Record, bool, error) {
-	if off < l.LogStart() || off+headerSize > l.LogEnd() {
-		return Record{}, false, nil
-	}
-	var h [headerSize]byte
-	if _, err := dev.ReadAt(h[:], off); err != nil {
+func (w *window) readRecord(off int64, epoch, index uint64) (Record, bool, error) {
+	h, err := w.bytes(off, headerSize)
+	if err != nil || h == nil {
 		return Record{}, false, err
 	}
 	if binary.LittleEndian.Uint32(h[0:]) != recMagic {
 		return Record{}, false, nil
 	}
 	n := int(binary.LittleEndian.Uint32(h[4:]))
-	if n > l.MaxBatch || off+EncodedLen(n) > l.LogEnd() {
+	if n > w.l.MaxBatch || off+EncodedLen(n) > w.l.LogEnd() {
 		return Record{}, false, nil
 	}
 	if binary.LittleEndian.Uint64(h[8:]) != epoch || binary.LittleEndian.Uint64(h[16:]) != index {
 		return Record{}, false, nil
 	}
-	payload := make([]byte, n)
-	if n > 0 {
-		if _, err := dev.ReadAt(payload, off+headerSize); err != nil {
-			return Record{}, false, err
-		}
-	}
+	want := binary.LittleEndian.Uint32(h[24:])
 	crc := crc32.Checksum(h[0:24], castagnoli)
-	crc = crc32.Update(crc, castagnoli, payload)
-	if binary.LittleEndian.Uint32(h[24:]) != crc {
+	body, err := w.bytes(off+headerSize, n)
+	if err != nil || (body == nil && n > 0) {
+		return Record{}, false, err
+	}
+	if crc32.Update(crc, castagnoli, body) != want {
 		return Record{}, false, nil
 	}
+	payload := make([]byte, n)
+	copy(payload, body)
 	return Record{Epoch: epoch, Index: index, Payload: payload, End: off + EncodedLen(n)}, true, nil
 }
 
 // Scan reads consecutive valid records of one epoch, starting with the
 // record expected at (off, index). It stops at the first position that does
 // not hold the expected record, or at limit if limit is non-negative. fn may
-// be nil. It returns the offset and index where the next record would go.
+// be nil. It returns the offset just past the last record read and the index
+// the next record would have.
+//
+// A batch always starts on a block boundary, so after the last record of a
+// batch the next record is found at the following boundary, not directly
+// behind it. Scan looks in both places.
 func Scan(dev disk.Device, l disk.Layout, epoch uint64, off int64, index uint64, limit int64, fn func(Record)) (int64, uint64, error) {
+	w := &window{dev: dev, l: l}
 	for {
 		if limit >= 0 && off >= limit {
 			return off, index, nil
 		}
-		rec, ok, err := readRecord(dev, l, off, epoch, index)
+		rec, ok, err := w.readRecord(off, epoch, index)
 		if err != nil {
 			return off, index, err
+		}
+		if !ok && off != disk.AlignUp(off) {
+			rec, ok, err = w.readRecord(disk.AlignUp(off), epoch, index)
+			if err != nil {
+				return off, index, err
+			}
 		}
 		if !ok || (limit >= 0 && rec.End > limit) {
 			return off, index, nil
@@ -129,35 +182,51 @@ func NewWriter(dev disk.Device, l disk.Layout, epoch uint64, off int64, index ui
 
 // Append writes a batch of records with one device write and one sync. This
 // is the group commit: throughput is batches per second times batch size.
-// It returns the index of the first record. On error nothing is advanced.
+// The write starts on a block boundary and is padded to a whole number of
+// blocks. It returns the index of the first record. On error nothing is
+// advanced.
 func (w *Writer) Append(batch [][]byte) (uint64, error) {
 	var size int64
 	for _, p := range batch {
 		size += EncodedLen(len(p))
 	}
-	if size > int64(w.l.MaxBatch) {
+	start := disk.AlignUp(w.off)
+	padded := disk.AlignUp(size)
+	if padded > int64(w.l.MaxBatch) {
 		return 0, ErrTooLarge
 	}
-	if w.off+size > w.l.LogEnd() {
+	if start+padded > w.l.LogEnd() {
 		return 0, ErrLogFull
 	}
-	buf := make([]byte, 0, size)
+	buf := make([]byte, 0, padded)
 	for i, p := range batch {
 		buf = encode(buf, w.epoch, w.next+uint64(i), p)
 	}
-	if _, err := w.dev.WriteAt(buf, w.off); err != nil {
+	buf = buf[:padded] // zero padding to the block boundary
+	if _, err := w.dev.WriteAt(buf, start); err != nil {
 		return 0, err
 	}
 	if err := w.dev.Sync(); err != nil {
 		return 0, err
 	}
 	first := w.next
-	w.off += size
+	w.off = start + size
 	w.next += uint64(len(batch))
 	return first, nil
 }
 
-// Offset is where the next record will be written.
+// Fits reports whether a batch with these payload sizes can be appended in
+// one write.
+func Fits(l disk.Layout, sizes []int) bool {
+	var size int64
+	for _, n := range sizes {
+		size += EncodedLen(n)
+	}
+	return disk.AlignUp(size) <= int64(l.MaxBatch)
+}
+
+// Offset is the end of the last record written. The next batch starts at
+// the block boundary at or after it.
 func (w *Writer) Offset() int64 { return w.off }
 
 // NextIndex is the index the next record will get.

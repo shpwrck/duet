@@ -172,10 +172,12 @@ func (n *Node) Campaign() error {
 		if err != nil {
 			return lease.EpochRecord{}, err
 		}
-		// Leave a gap one batch wide. A deposed writer can have at most one
-		// batch in flight, and it lands within one batch of the cutoff, so
-		// it can never reach the new epoch's records.
-		start := (end + int64(n.l.MaxBatch) + 7) &^ 7
+		// Leave a gap one batch wide and start on a block boundary. A deposed
+		// writer can have at most one batch in flight; it starts at the
+		// boundary at or after its own tail, which is at or before the
+		// cutoff, and is at most MaxBatch long. MaxBatch is a whole number
+		// of blocks, so that write ends at or before this start.
+		start := disk.AlignUp(end + int64(n.l.MaxBatch))
 		if start+int64(n.l.MaxBatch) > n.l.LogEnd() {
 			return lease.EpochRecord{}, wal.ErrLogFull
 		}
