@@ -271,6 +271,37 @@ api_zone_down() { # every member in one zone killed for 40 s: the worst zone for
   for i in $down; do start_member "$i"; done
 }
 
+api_freeze() { # leader process frozen for 20 s, then resumed
+  local l
+  l="$(leader)"
+  node "$l" "sudo systemctl kill -s STOP $(unit)"
+  sleep 20
+  node "$l" "sudo systemctl kill -s CONT $(unit)"
+}
+api_vm_suspend() { # the leader's whole VM suspended by the hypervisor, then resumed
+  local l
+  l="$(leader)"
+  if ! gcloud compute instances suspend "${NAME[$l]}" --zone "${ZONE[$l]}" --project "$PROJECT" --quiet; then
+    echo "suspend not available for this instance; scenario ran with no fault" >&2
+    return 0
+  fi
+  sleep 25
+  gcloud compute instances resume "${NAME[$l]}" --zone "${ZONE[$l]}" --project "$PROJECT" --quiet
+}
+api_vm_reset() { # the leader's VM hard reset with no shutdown
+  local l
+  l="$(leader)"
+  gcloud compute instances reset "${NAME[$l]}" --zone "${ZONE[$l]}" --project "$PROJECT" --quiet
+  sleep 30
+  wait_ssh "${NAME[$l]}" "${ZONE[$l]}"
+  start_member "$l"
+}
+api_all_down() { # every member killed at once, started again ten seconds later
+  for i in $(members); do node "$i" "sudo systemctl kill -s KILL $(unit)" || true; done
+  sleep 10
+  for i in $(members); do start_member "$i"; done
+}
+
 for BACKEND in duet etcd; do
   if [ "$BACKEND" = duet ]; then
     node 0 "sudo duet format -device $DEV -nodes 2 -ttl $TTL -epoch-slots 1024 -max-batch 1048576 -checkpoint-size 2147483648"
@@ -282,6 +313,10 @@ for BACKEND in duet etcd; do
   api_scenario stop 60 8 api_stop
   api_scenario kill 90 8 api_kill
   api_scenario zone_down 120 8 api_zone_down
+  api_scenario freeze 90 8 api_freeze
+  api_scenario vm_suspend 120 8 api_vm_suspend
+  api_scenario vm_reset 180 8 api_vm_reset
+  api_scenario all_down 90 8 api_all_down
   for i in $(members); do node "$i" "sudo systemctl stop $(unit)" || true; done
 done
 

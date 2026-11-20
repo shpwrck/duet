@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -514,4 +516,89 @@ func TestNodesCannotReachEachOther(t *testing.T) {
 	}
 	t.Logf("owner killed while partitioned: 200 steps in %s, %d failed calls, slowest step %s",
 		time.Since(began).Round(100*time.Millisecond), failed, worst.Round(10*time.Millisecond))
+}
+
+// Planned stops, over and over: the owner is told to stop, the other node
+// takes over, the stopped node comes back. A client that knows both nodes
+// should barely notice any of them.
+func TestRepeatedPlannedStops(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts real processes; skipped with -short")
+	}
+	c, _ := setup(t)
+	eps := []string{freeAddr(t), freeAddr(t)}
+	addrs := []string{freeAddr(t), freeAddr(t)}
+	dirs := []string{t.TempDir(), t.TempDir()}
+	start := func(i int) *proc {
+		return c.start(i, addrs[i], "-etcd", eps[i], "-etcd-peers", strings.Join(eps, ","), "-state-dir", dirs[i])
+	}
+	for i := 0; i < 2; i++ {
+		c.nodes = append(c.nodes, start(i))
+	}
+	defer func() {
+		for _, p := range c.nodes {
+			p.cmd.Process.Kill()
+			p.cmd.Wait()
+		}
+	}()
+	c.owner()
+	const workers = 4
+	var worst atomic.Int64
+	var total atomic.Int64
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			cli, err := clientv3.New(clientv3.Config{Endpoints: eps, DialTimeout: 2 * time.Second})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer cli.Close()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				begin := time.Now()
+				for {
+					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+					_, err := cli.Put(ctx, fmt.Sprintf("/p/%d", w), strconv.Itoa(i))
+					cancel()
+					if err == nil {
+						break
+					}
+				}
+				total.Add(1)
+				if d := int64(time.Since(begin)); d > worst.Load() {
+					worst.Store(d)
+				}
+			}
+		}(w)
+	}
+	var gaps []string
+	slowest := time.Duration(0)
+	for cycle := 0; cycle < 8; cycle++ {
+		time.Sleep(1500 * time.Millisecond)
+		o := c.owner()
+		worst.Store(0)
+		o.cmd.Process.Signal(syscall.SIGTERM)
+		o.cmd.Wait()
+		time.Sleep(1500 * time.Millisecond)
+		d := time.Duration(worst.Load())
+		gaps = append(gaps, d.Round(10*time.Millisecond).String())
+		if d > slowest {
+			slowest = d
+		}
+		c.nodes[o.id] = start(o.id)
+	}
+	close(stop)
+	wg.Wait()
+	t.Logf("%d writes; slowest write around each of 8 planned stops: %s", total.Load(), strings.Join(gaps, ", "))
+	if slowest > 1500*time.Millisecond {
+		t.Fatalf("a planned stop held a write for %s; the handover itself takes a fraction of a second", slowest)
+	}
 }

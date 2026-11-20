@@ -25,7 +25,7 @@ jobs:
   lab:
     if: inputs.confirm == 'create billable resources'
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 115
     env:
       # Set these three as repository variables; deploy/lab-gcp/setup.sh prints them.
       RAW_PROJECT: ${{ vars.GCP_PROJECT }}
